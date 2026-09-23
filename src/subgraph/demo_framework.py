@@ -50,6 +50,7 @@ class Partition:
     ops: list[int]
     cycles: int
     rank_u: int
+    pipe_cycles: dict[str, int] = field(default_factory=dict)
     preds: set[int] = field(default_factory=set)
     succs: set[int] = field(default_factory=set)
 
@@ -82,7 +83,7 @@ def _op_graph(graph: dict[str, Any]) -> tuple[dict[int, set[int]], dict[int, set
             if source != target:
                 succs[source].add(target)
                 preds[target].add(source)
-                edge_sizes[(source, target)] = 0
+                edge_sizes.setdefault((source, target), 0)
         elif source in op_ids and target in tensor_by_id:
             producers.setdefault(target, set()).add(source)
         elif source in tensor_by_id and target in op_ids:
@@ -96,7 +97,10 @@ def _op_graph(graph: dict[str, Any]) -> tuple[dict[int, set[int]], dict[int, set
                     continue
                 succs[source].add(target)
                 preds[target].add(source)
-                edge_sizes[(source, target)] = max(edge_sizes.get((source, target), 0), size)
+                # A producer/consumer pair may be connected by multiple
+                # tensors.  Communication is the sum of those tensor bytes,
+                # not the largest tensor only.
+                edge_sizes[(source, target)] = edge_sizes.get((source, target), 0) + size
     return preds, succs, edge_sizes
 
 
@@ -128,20 +132,31 @@ def analyze_graph(graph: dict[str, Any]) -> GraphFeatures:
     contracted_preds = {node: set() for node in eligible}
     contracted_succs = {node: set() for node in eligible}
     eligible_set = set(eligible)
+    contracted_edge_sizes: dict[tuple[int, int], int] = {}
     for source in eligible:
-        stack = list(succs[source])
-        seen: set[int] = set()
+        # Keep the largest boundary tensor-path estimate seen for each COPY
+        # node.  COPY contraction can expose several paths, but revisiting a
+        # node is only useful when the carried byte estimate increases.
+        stack = [(target, edge_sizes.get((source, target), 0)) for target in succs[source]]
+        seen_weight: dict[int, int] = {}
         while stack:
-            target = stack.pop()
+            target, path_bytes = stack.pop()
             if target in eligible_set:
                 if target != source:
                     contracted_succs[source].add(target)
                     contracted_preds[target].add(source)
+                    key = (source, target)
+                    contracted_edge_sizes[key] = max(
+                        contracted_edge_sizes.get(key, 0), path_bytes
+                    )
                 continue
-            if target in seen:
+            if path_bytes <= seen_weight.get(target, -1):
                 continue
-            seen.add(target)
-            stack.extend(succs[target])
+            seen_weight[target] = path_bytes
+            stack.extend(
+                (next_target, max(path_bytes, edge_sizes.get((target, next_target), 0)))
+                for next_target in succs[target]
+            )
 
     topo = _topological_order(eligible, contracted_preds, contracted_succs)
     depth: dict[int, int] = {}
@@ -161,7 +176,7 @@ def analyze_graph(graph: dict[str, Any]) -> GraphFeatures:
         tensor_by_id=tensor_by_id,
         preds=contracted_preds,
         succs=contracted_succs,
-        edge_sizes=edge_sizes,
+        edge_sizes=contracted_edge_sizes,
         topo_order=topo,
         depth=depth,
         rank_u=rank_u,
@@ -170,13 +185,10 @@ def analyze_graph(graph: dict[str, Any]) -> GraphFeatures:
 
 
 def _edge_size(features: GraphFeatures, source: int, target: int) -> int:
-    if (source, target) in features.edge_sizes:
-        return features.edge_sizes[(source, target)]
-    # COPY contraction can hide the tensor edge.  A small conservative fallback
-    # is enough for this baseline and keeps the partitioner independent of the
-    # evaluator implementation.
-    sizes = [int(t.get("size", 0)) for t in features.tensor_by_id.values()]
-    return max(sizes, default=0)
+    # Missing edge metadata means there is no known tensor transfer.  Falling
+    # back to the largest tensor in the whole graph severely overestimates
+    # unrelated dependencies after COPY contraction.
+    return features.edge_sizes.get((source, target), 0)
 
 
 def build_partitions(features: GraphFeatures, max_ops: int = 16, max_cycles: int = 20000) -> list[Partition]:
@@ -209,6 +221,10 @@ def build_partitions(features: GraphFeatures, max_ops: int = 16, max_cycles: int
             partitions.append(candidate)
         candidate.ops.append(node)
         candidate.cycles += int(op.get("cycles", 0))
+        pipe = str(op.get("pipe", "UNKNOWN"))
+        candidate.pipe_cycles[pipe] = candidate.pipe_cycles.get(pipe, 0) + int(
+            op.get("cycles", 0)
+        )
         candidate.rank_u = max(candidate.rank_u, features.rank_u[node])
         op_to_partition[node] = candidate.id
 
@@ -250,31 +266,66 @@ def schedule_partitions(
     core_of: dict[int, int] = {}
     core_orders: list[list[int]] = [[] for _ in range(num_cores)]
     bandwidth = 60
+    # Scene-A uses a cheaper same-core wait than a cross-core wait.  These are
+    # the fixed evaluator values from config.txt.
+    same_core_wait = 100
+    cross_core_wait = 1000
+    core_pipe_load: list[dict[str, int]] = [dict() for _ in range(num_cores)]
+    estimated_ddr_bytes = 0
 
     while ready:
         ready.sort(key=lambda pid: (-by_id[pid].rank_u, topo_position[pid]))
         pid = ready.pop(0)
         partition = by_id[pid]
-        best: tuple[int, int, int] | None = None
+        best: tuple[float, float, float, int, int] | None = None
         for core in range(num_cores):
             dependency_ready = 0
+            candidate_edge_bytes = 0
             for pred in partition.preds:
                 delay = 0
                 if scenario == "q1":
-                    delay = 100 + math.ceil(_partition_edge_size(partitions, features, pred, pid) / bandwidth)
+                    edge_bytes = _partition_edge_size(partitions, features, pred, pid)
+                    candidate_edge_bytes += edge_bytes
+                    delay = (
+                        same_core_wait if core_of.get(pred) == core else cross_core_wait
+                    ) + math.ceil(edge_bytes / bandwidth)
                 elif core_of.get(pred) != core:
-                    delay = 500 + math.ceil(_partition_edge_size(partitions, features, pred, pid) / bandwidth)
+                    edge_bytes = _partition_edge_size(partitions, features, pred, pid)
+                    candidate_edge_bytes += edge_bytes
+                    delay = 500 + math.ceil(edge_bytes / bandwidth)
                 dependency_ready = max(dependency_ready, finish[pred] + delay)
             start = max(core_time[core], dependency_ready)
             end = start + partition.cycles
-            choice = (end, core_time[core], core)
+            # Pipe work is a lower-bound signal for the evaluator's overlapped
+            # intra-core execution.  Keep the conservative total-cycle end
+            # estimate, but prefer placements with lower per-pipe pressure.
+            pipe_load = dict(core_pipe_load[core])
+            for pipe, work in partition.pipe_cycles.items():
+                pipe_load[pipe] = pipe_load.get(pipe, 0) + work
+            max_pipe_load = max(pipe_load.values(), default=0)
+            total_pipe_work = sum(pipe_load.values())
+            avg_pipe_load = total_pipe_work / max(1, len(pipe_load))
+            pipe_imbalance = max_pipe_load / max(1.0, avg_pipe_load)
+            ddr_lb = (estimated_ddr_bytes + candidate_edge_bytes) / bandwidth
+            # The lower bound cannot be hidden below the compute estimate.
+            objective_end = max(float(end), ddr_lb)
+            choice = (objective_end, pipe_imbalance, max_pipe_load, end, core)
             if best is None or choice < best:
                 best = choice
         assert best is not None
-        end, _, core = best
+        _, _, _, end, core = best
+        candidate_edge_bytes = 0
+        for pred in partition.preds:
+            if scenario == "q1" or core_of.get(pred) != core:
+                candidate_edge_bytes += _partition_edge_size(
+                    partitions, features, pred, pid
+                )
+        estimated_ddr_bytes += candidate_edge_bytes
         core_of[pid] = core
         core_time[core] = end
         finish[pid] = end
+        for pipe, work in partition.pipe_cycles.items():
+            core_pipe_load[core][pipe] = core_pipe_load[core].get(pipe, 0) + work
         core_orders[core].append(pid)
         for successor in partition.succs:
             remaining[successor] -= 1
