@@ -61,6 +61,7 @@ def _call_algorithm(
     graph: dict[str, Any],
     num_cores: int,
     scenario: str,
+    local_search_algorithm: str = "none",
 ) -> dict[str, Any]:
     """Call algorithms with the common interface, allowing simple baselines."""
     parameters = inspect.signature(algorithm).parameters
@@ -69,6 +70,8 @@ def _call_algorithm(
         kwargs["num_cores"] = num_cores
     if "scenario" in parameters:
         kwargs["scenario"] = scenario
+    if "local_search_algorithm" in parameters:
+        kwargs["local_search_algorithm"] = local_search_algorithm
     plan = algorithm(graph, **kwargs)
     if not isinstance(plan, dict):
         raise TypeError("algorithm must return a plan object")
@@ -136,6 +139,7 @@ def evaluate(
     output_dir: Path,
     cores: tuple[int, ...] = CORE_COUNTS,
     problems: tuple[int, ...] = PROBLEMS,
+    local_search_algorithm: str = "none",
 ) -> dict[str, Any]:
     graph_path = graph_path.resolve()
     config_path = config_path.resolve()
@@ -152,7 +156,13 @@ def evaluate(
         plans: dict[str, str] = {}
         for problem in problems:
             scenario = f"q{problem}"
-            plan = _call_algorithm(algorithm, graph, num_cores, scenario)
+            plan = _call_algorithm(
+                algorithm,
+                graph,
+                num_cores,
+                scenario,
+                local_search_algorithm,
+            )
             plan_path = output_dir / f"plan_{scenario}_{num_cores}cores.json"
             plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             plans[scenario] = str(plan_path)
@@ -243,6 +253,7 @@ def evaluate_cases(
     problems: tuple[int, ...] = PROBLEMS,
     make_plots: bool = False,
     workers: int = DEFAULT_WORKERS,
+    local_search_algorithm: str = "none",
 ) -> dict[str, Any]:
     """Evaluate cases concurrently, keeping only per-case output artifacts."""
     if workers < 1:
@@ -264,6 +275,7 @@ def evaluate_cases(
             case_output_dir,
             cores,
             problems,
+            local_search_algorithm,
         )
         futures[future] = (index, graph_path, case_output_dir)
 
@@ -437,6 +449,12 @@ def main(argv: list[str] | None = None) -> int:
         default="subgraph.demo_framework:build_plan",
         help="算法入口 module:callable，默认使用 demo_framework:build_plan",
     )
+    parser.add_argument(
+        "--local-search",
+        choices=("none", "move_swap"),
+        default="none",
+        help="传给支持该参数的算法的局部搜索策略；默认关闭",
+    )
     parser.add_argument("--config", type=Path, help="评测 config.txt")
     parser.add_argument(
         "--cases-dir",
@@ -508,6 +526,7 @@ def main(argv: list[str] | None = None) -> int:
             problems,
             make_plots=args.plot is True,
             workers=args.workers,
+            local_search_algorithm=args.local_search,
         )
         return 1 if batch["failed"] else 0
 
@@ -520,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir,
         cores,
         problems,
+        args.local_search,
     )
     make_plot = args.plot is not False
     figure_outputs = [] if not make_plot else [str(path) for path in plot_speedup(aggregate, output_dir)]

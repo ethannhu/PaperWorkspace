@@ -451,19 +451,230 @@ def _partition_transfer_bytes(
     evaluator transfers that tensor once per remote task, so counting every
     operation pair would overstate the communication volume.
     """
-    total = 0
-    for tensor_id, tensor in features.tensor_by_id.items():
-        produced_by_source = any(
-            tensor_id in features.output_tensors.get(op_id, set())
-            for op_id in source.ops
-        )
-        consumed_by_target = any(
-            tensor_id in features.input_tensors.get(op_id, set())
-            for op_id in target.ops
-        )
-        if produced_by_source and consumed_by_target:
-            total += int(tensor.get("size", 0))
-    return total
+    produced = set().union(
+        *(features.output_tensors.get(op_id, set()) for op_id in source.ops)
+    )
+    consumed = set().union(
+        *(features.input_tensors.get(op_id, set()) for op_id in target.ops)
+    )
+    return sum(
+        int(features.tensor_by_id[tensor_id].get("size", 0))
+        for tensor_id in produced & consumed
+    )
+
+
+def _core_orders_are_valid(
+    partitions: list[Partition], core_orders: list[list[int]]
+) -> tuple[list[int], dict[tuple[int, int], bool]] | None:
+    """Return a topological order after adding per-core order constraints.
+
+    The evaluator requires both the partition DAG and each core schedule to be
+    acyclic.  A move that is locally harmless can still create a cycle through
+    a cross-core dependency, so every local-search candidate goes through this
+    small exact check.
+    """
+    by_id = {partition.id: partition for partition in partitions}
+    all_ids = set(by_id)
+    if set(pid for order in core_orders for pid in order) != all_ids:
+        return None
+    if any(len(order) != len(set(order)) for order in core_orders):
+        return None
+
+    succs = {pid: set(by_id[pid].succs) for pid in all_ids}
+    preds = {pid: set(by_id[pid].preds) for pid in all_ids}
+    original_edges: dict[tuple[int, int], bool] = {}
+    for source in all_ids:
+        for target in by_id[source].succs:
+            original_edges[(source, target)] = True
+
+    # Consecutive tasks on one core are ordered, but do not carry tensor data.
+    for order in core_orders:
+        for source, target in zip(order, order[1:]):
+            if target not in succs[source]:
+                succs[source].add(target)
+                preds[target].add(source)
+            original_edges.setdefault((source, target), False)
+
+    ready = sorted(pid for pid in all_ids if not preds[pid])
+    topo: list[int] = []
+    while ready:
+        pid = ready.pop(0)
+        topo.append(pid)
+        for target in sorted(succs[pid]):
+            preds[target].remove(pid)
+            if not preds[target]:
+                ready.append(target)
+                ready.sort()
+    if len(topo) != len(all_ids):
+        return None
+    return topo, original_edges
+
+
+def _proxy_schedule_objective(
+    partitions: list[Partition],
+    features: GraphFeatures,
+    core_orders: list[list[int]],
+    num_cores: int,
+    scenario: str,
+    transfer_bytes: dict[tuple[int, int], int] | None = None,
+) -> tuple[float, int, int] | None:
+    """Score one complete placement using the evaluator's fixed delays.
+
+    This is intentionally a cheap filter, not a replacement for the official
+    evaluator.  The tuple prioritizes proxy makespan, then communication, then
+    compute imbalance.
+    """
+    checked = _core_orders_are_valid(partitions, core_orders)
+    if checked is None:
+        return None
+    topo, edge_kinds = checked
+    core_of = {
+        pid: core
+        for core, order in enumerate(core_orders)
+        for pid in order
+    }
+    by_id = {partition.id: partition for partition in partitions}
+    transfer_bytes = transfer_bytes or {
+        (source.id, target.id): _partition_transfer_bytes(features, source, by_id[target_id])
+        for source in partitions
+        for target_id in source.succs
+        for target in [by_id[target_id]]
+    }
+    artificial_preds: dict[int, list[int]] = {pid: [] for pid in by_id}
+    for (source, target), is_original in edge_kinds.items():
+        if not is_original:
+            artificial_preds[target].append(source)
+    finish: dict[int, int] = {}
+    traffic = 0
+    bandwidth = 60
+    for pid in topo:
+        start = 0
+        for pred in by_id[pid].preds:
+            edge_bytes = transfer_bytes.get((pred, pid), 0)
+            same_core = core_of[pred] == core_of[pid]
+            if scenario == "q1":
+                delay = (100 if same_core else 1000) + math.ceil(edge_bytes / bandwidth)
+                traffic += edge_bytes
+            elif not same_core:
+                delay = 500 + math.ceil(edge_bytes / bandwidth)
+                traffic += edge_bytes
+            else:
+                delay = 0
+            start = max(start, finish[pred] + delay)
+        # Artificial same-core sequence edges have no tensor dependency and
+        # are already represented by the predecessor finish time.
+        for pred in artificial_preds[pid]:
+            start = max(start, finish[pred])
+        finish[pid] = start + by_id[pid].cycles
+
+    loads = [sum(by_id[pid].cycles for pid in order) for order in core_orders]
+    return max(finish.values(), default=0), traffic, max(loads, default=0) - min(loads, default=0)
+
+
+def _local_search(
+    partitions: list[Partition],
+    features: GraphFeatures,
+    core_of: dict[int, int],
+    core_orders: list[list[int]],
+    num_cores: int,
+    scenario: str,
+    max_iterations: int = 4,
+) -> tuple[dict[int, int], list[list[int]], dict[str, Any]]:
+    """Run a small deterministic best-improvement move/swap search."""
+    if num_cores < 2 or len(partitions) < 2 or max_iterations <= 0:
+        return core_of, core_orders, {"iterations": 0, "moves": 0}
+
+    current = [list(order) for order in core_orders]
+    by_id = {partition.id: partition for partition in partitions}
+    transfer_bytes = {
+        (source.id, target.id): _partition_transfer_bytes(features, source, target)
+        for source in partitions
+        for target_id in source.succs
+        for target in [by_id[target_id]]
+    }
+    current_score = _proxy_schedule_objective(
+        partitions, features, current, num_cores, scenario, transfer_bytes
+    )
+    if current_score is None:
+        return core_of, core_orders, {"iterations": 0, "moves": 0, "invalid_initial": True}
+
+    moves = 0
+    iterations = 0
+    by_id = {partition.id: partition for partition in partitions}
+    for _ in range(max_iterations):
+        iterations += 1
+        loads = [sum(by_id[pid].cycles for pid in order) for order in current]
+        busiest = max(range(num_cores), key=lambda core: (loads[core], -core))
+        candidate_best: tuple[tuple[float, int, int], list[list[int]], str] | None = None
+
+        # Move one task from the busiest core to another core.  Appending is
+        # sufficient for the minimal search; the validity check rejects cycles.
+        # Search the largest/most critical tasks first and cap the candidate
+        # set so the cheap local improvement remains practical on large DAGs.
+        candidate_pids = sorted(
+            current[busiest],
+            key=lambda pid: (-by_id[pid].cycles, -by_id[pid].rank_u, pid),
+        )[:12]
+        for pid in candidate_pids:
+            for target in range(num_cores):
+                if target == busiest:
+                    continue
+                candidate = [list(order) for order in current]
+                candidate[busiest].remove(pid)
+                candidate[target].append(pid)
+                score = _proxy_schedule_objective(
+                    partitions, features, candidate, num_cores, scenario, transfer_bytes
+                )
+                if score is not None and score < current_score:
+                    item = (score, candidate, f"move:{pid}:{busiest}->{target}")
+                    if candidate_best is None or item[0] < candidate_best[0]:
+                        candidate_best = item
+
+        # Also try pairwise swaps involving the busiest core.  This often
+        # fixes a bad critical-path placement without changing core loads.
+        for left_pid in candidate_pids:
+            for target in range(num_cores):
+                if target == busiest:
+                    continue
+                right_pids = sorted(
+                    current[target],
+                    key=lambda pid: (-by_id[pid].cycles, -by_id[pid].rank_u, pid),
+                )[:8]
+                for right_pid in right_pids:
+                    candidate = [list(order) for order in current]
+                    left_index = candidate[busiest].index(left_pid)
+                    right_index = candidate[target].index(right_pid)
+                    candidate[busiest][left_index] = right_pid
+                    candidate[target][right_index] = left_pid
+                    score = _proxy_schedule_objective(
+                        partitions, features, candidate, num_cores, scenario, transfer_bytes
+                    )
+                    if score is not None and score < current_score:
+                        item = (score, candidate, f"swap:{left_pid}:{right_pid}")
+                        if candidate_best is None or item[0] < candidate_best[0]:
+                            candidate_best = item
+
+        if candidate_best is None:
+            break
+        current_score, current, _ = candidate_best
+        moves += 1
+
+    selected_core_of = {
+        pid: core
+        for core, order in enumerate(current)
+        for pid in order
+    }
+    return selected_core_of, current, {
+        "iterations": iterations,
+        "moves": moves,
+        "proxy_score": current_score,
+    }
+
+
+LOCAL_SEARCH_ALGORITHMS = {
+    "none": None,
+    "move_swap": _local_search,
+}
 
 
 def build_plan(
@@ -472,7 +683,17 @@ def build_plan(
     scenario: str = "q2",
     include_diagnostics: bool = False,
     partition_algorithm: str = "semantic",
+    local_search_algorithm: str = "none",
+    local_search_iterations: int = 4,
+    local_search: bool | None = None,
 ) -> dict[str, Any]:
+    # Keep the old boolean as a compatibility alias while making the named
+    # strategy the primary, pluggable interface.
+    if local_search is not None:
+        local_search_algorithm = "move_swap" if local_search else "none"
+    if local_search_algorithm not in LOCAL_SEARCH_ALGORITHMS:
+        available = ", ".join(sorted(LOCAL_SEARCH_ALGORITHMS))
+        raise ValueError(f"unknown local search algorithm: {local_search_algorithm}; available: {available}")
     features = analyze_graph(graph)
     partitions = build_partitions(features, algorithm=partition_algorithm)
     scheduled = schedule_partitions(
@@ -486,6 +707,25 @@ def build_plan(
         core_of, core_orders, diagnostics = scheduled
     else:
         core_of, core_orders = scheduled
+    search_diagnostics = {
+        "algorithm": local_search_algorithm,
+        "iterations": 0,
+        "moves": 0,
+        "enabled": local_search_algorithm != "none",
+    }
+    search_algorithm = LOCAL_SEARCH_ALGORITHMS[local_search_algorithm]
+    if search_algorithm is not None:
+        core_of, core_orders, search_diagnostics = search_algorithm(
+            partitions,
+            features,
+            core_of,
+            core_orders,
+            num_cores,
+            scenario,
+            max_iterations=local_search_iterations,
+        )
+        search_diagnostics.setdefault("algorithm", local_search_algorithm)
+        search_diagnostics.setdefault("enabled", True)
     node_to_subgraph = {
         str(op_id): partition.id
         for partition in partitions
@@ -499,6 +739,7 @@ def build_plan(
     }
     if include_diagnostics:
         plan["diagnostics"] = diagnostics
+        plan["diagnostics"]["local_search"] = search_diagnostics
     return plan
 
 
@@ -521,6 +762,12 @@ def main(argv: list[str] | None = None) -> int:
         default="semantic",
         help="分组算法；默认 semantic，可选历史朴素算法 naive",
     )
+    parser.add_argument(
+        "--local-search",
+        choices=tuple(LOCAL_SEARCH_ALGORITHMS),
+        default="none",
+        help="局部搜索策略；默认关闭，可选 move_swap",
+    )
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument(
         "--diagnostics-output",
@@ -535,6 +782,7 @@ def main(argv: list[str] | None = None) -> int:
         args.scenario,
         include_diagnostics=args.diagnostics_output is not None,
         partition_algorithm=args.partition_algorithm,
+        local_search_algorithm=args.local_search,
     )
     diagnostics = plan.pop("diagnostics", None)
     output = args.output or args.graph.with_name(f"{args.graph.stem}_multicore_res.json")
