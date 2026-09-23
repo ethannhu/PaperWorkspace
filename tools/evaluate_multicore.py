@@ -3,7 +3,10 @@
 The algorithm is supplied as ``module:callable`` and must return the standard
 multicore plan dictionary.  The runner evaluates one-core baseline plus 2--5
 cores, keeps every individual plan/evaluator result, and writes one aggregate
-JSON file.  Plotting is intentionally a separate backend-specific step.
+JSON file.  When no graph is supplied, the runner discovers and evaluates the
+100 ``case_*.json`` files under ``artifacts/data`` and displays case-level
+progress with tqdm.  Plotting is intentionally a separate backend-specific
+step.
 
 Example::
 
@@ -12,6 +15,9 @@ Example::
         --algorithm subgraph.demo_framework:build_plan \
         --config artifacts/data/config.txt \
         -o results/case_001
+
+    PYTHONPATH=src uv run tools/evaluate_multicore.py \
+        --algorithm subgraph.demo_framework:build_plan
 """
 
 from __future__ import annotations
@@ -22,12 +28,17 @@ import inspect
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
+
+from tqdm import tqdm
 
 
 PROBLEMS = (1, 2, 3)
 CORE_COUNTS = (1, 2, 3, 4, 5)
+DEFAULT_CASE_COUNT = 100
+DEFAULT_WORKERS = 4
 
 
 def _load_callable(spec: str) -> Callable[..., dict[str, Any]]:
@@ -194,6 +205,109 @@ def evaluate(
     return aggregate
 
 
+def discover_cases(cases_dir: Path, case_count: int = DEFAULT_CASE_COUNT) -> list[Path]:
+    """Return the first ``case_count`` zero-padded challenge cases."""
+    if case_count < 1:
+        raise ValueError("case_count must be at least 1")
+    cases_dir = cases_dir.resolve()
+    graph_paths = sorted(cases_dir.glob("case_*.json"))
+    if len(graph_paths) < case_count:
+        raise FileNotFoundError(
+            f"expected at least {case_count} case_*.json files in {cases_dir}, "
+            f"found {len(graph_paths)}"
+        )
+    return graph_paths[:case_count]
+
+
+def evaluate_cases(
+    graph_paths: list[Path],
+    algorithm_spec: str,
+    output_dir: Path,
+    config_path: Path | None = None,
+    cores: tuple[int, ...] = CORE_COUNTS,
+    problems: tuple[int, ...] = PROBLEMS,
+    make_plots: bool = False,
+    workers: int = DEFAULT_WORKERS,
+) -> dict[str, Any]:
+    """Evaluate cases concurrently and write a batch summary."""
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    case_results: list[dict[str, Any] | None] = [None] * len(graph_paths)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for index, graph_path in enumerate(graph_paths):
+            case_output_dir = output_dir / graph_path.stem
+            case_config = config_path or graph_path.parent / "config.txt"
+            future = executor.submit(
+                evaluate,
+                graph_path,
+                algorithm_spec,
+                case_config,
+                case_output_dir,
+                cores,
+                problems,
+            )
+            futures[future] = (index, graph_path, case_output_dir)
+
+        progress = tqdm(
+            total=len(futures),
+            desc="Evaluating cases",
+            unit="case",
+            dynamic_ncols=True,
+        )
+        for future in as_completed(futures):
+            index, graph_path, case_output_dir = futures[future]
+            progress.set_postfix_str(graph_path.stem)
+            try:
+                aggregate = future.result()
+                figure_outputs = (
+                    [str(path) for path in plot_speedup(aggregate, case_output_dir)]
+                    if make_plots
+                    else []
+                )
+                case_results[index] = {
+                    "case": graph_path.stem,
+                    "graph": str(graph_path.resolve()),
+                    "status": "ok",
+                    "aggregate": str(case_output_dir / "aggregate.json"),
+                    "baseline_makespan": aggregate["baseline_makespan"],
+                    "figure_outputs": figure_outputs,
+                }
+            except Exception as exc:  # Keep the remaining cases evaluable.
+                case_results[index] = {
+                    "case": graph_path.stem,
+                    "graph": str(graph_path.resolve()),
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            finally:
+                progress.update()
+        progress.close()
+
+    cases = [item for item in case_results if item is not None]
+
+    successful = sum(item["status"] == "ok" for item in cases)
+    batch = {
+        "algorithm": algorithm_spec,
+        "case_count": len(cases),
+        "successful": successful,
+        "failed": len(cases) - successful,
+        "workers": workers,
+        "core_counts": list(cores),
+        "problems": list(problems),
+        "cases": cases,
+    }
+    summary_path = output_dir / "batch_aggregate.json"
+    summary_path.write_text(
+        json.dumps(batch, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return batch
+
+
 def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
     """Draw the Q1--Q3 speedup trend and export editable/vector formats."""
     import matplotlib as mpl
@@ -291,15 +405,45 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="运行 Q1-Q3 多核算法评测并聚合结果")
-    parser.add_argument("graph", type=Path, help="计算图 JSON")
+    parser = argparse.ArgumentParser(
+        description="运行 Q1-Q3 多核算法评测；省略 graph 时自动评测 100 个 cases"
+    )
+    parser.add_argument(
+        "graph",
+        type=Path,
+        nargs="?",
+        help="单个计算图 JSON；省略时进入 100 cases 批量模式",
+    )
     parser.add_argument(
         "--algorithm",
         default="subgraph.demo_framework:build_plan",
         help="算法入口 module:callable，默认使用 demo_framework:build_plan",
     )
     parser.add_argument("--config", type=Path, help="评测 config.txt")
-    parser.add_argument("-o", "--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--cases-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "artifacts" / "data",
+        help="批量模式的 case 目录；默认 artifacts/data",
+    )
+    parser.add_argument(
+        "--case-count",
+        type=int,
+        default=DEFAULT_CASE_COUNT,
+        help="批量模式评测的 case 数；默认 100",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"批量模式并发线程数；默认 {DEFAULT_WORKERS}",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        help="输出目录；批量模式默认 results/multicore_100cases",
+    )
     parser.add_argument(
         "--cores",
         nargs="+",
@@ -314,26 +458,62 @@ def main(argv: list[str] | None = None) -> int:
         choices=PROBLEMS,
         default=list(PROBLEMS),
     )
-    parser.add_argument(
-        "--no-plot",
+    plot_group = parser.add_mutually_exclusive_group()
+    plot_group.add_argument(
+        "--plot",
+        dest="plot",
         action="store_true",
+        default=None,
+        help="生成 speedup 图；单 case 模式默认开启，批量模式默认关闭",
+    )
+    plot_group.add_argument(
+        "--no-plot",
+        dest="plot",
+        action="store_false",
         help="只运行评测，不生成 speedup.svg/pdf/png",
     )
     args = parser.parse_args(argv)
-    config = args.config or args.graph.parent / "config.txt"
     if 1 not in args.cores:
         args.cores = [1, *args.cores]
+
+    cores = tuple(sorted(set(args.cores)))
+    problems = tuple(args.problems)
+    if args.graph is None:
+        output_dir = args.output_dir or Path("results/multicore_100cases")
+        graph_paths = discover_cases(args.cases_dir, args.case_count)
+        batch = evaluate_cases(
+            graph_paths,
+            args.algorithm,
+            output_dir,
+            args.config,
+            cores,
+            problems,
+            make_plots=args.plot is True,
+            workers=args.workers,
+        )
+        print(json.dumps({
+            "batch_aggregate": str(output_dir / "batch_aggregate.json"),
+            "case_count": batch["case_count"],
+            "successful": batch["successful"],
+            "failed": batch["failed"],
+            "workers": batch["workers"],
+        }, ensure_ascii=False))
+        return 1 if batch["failed"] else 0
+
+    output_dir = args.output_dir or Path("results") / args.graph.stem
+    config = args.config or args.graph.parent / "config.txt"
     aggregate = evaluate(
         args.graph,
         args.algorithm,
         config,
-        args.output_dir,
-        tuple(sorted(set(args.cores))),
-        tuple(args.problems),
+        output_dir,
+        cores,
+        problems,
     )
-    figure_outputs = [] if args.no_plot else [str(path) for path in plot_speedup(aggregate, args.output_dir)]
+    make_plot = args.plot is not False
+    figure_outputs = [] if not make_plot else [str(path) for path in plot_speedup(aggregate, output_dir)]
     print(json.dumps({
-        "aggregate": str(args.output_dir / "aggregate.json"),
+        "aggregate": str(output_dir / "aggregate.json"),
         "runs": len(aggregate["runs"]),
         "baseline_makespan": aggregate["baseline_makespan"],
         "figure_outputs": figure_outputs,
