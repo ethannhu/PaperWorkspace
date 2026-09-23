@@ -5,7 +5,8 @@ multicore plan dictionary.  The runner evaluates one-core baseline plus 2--5
 cores, keeps every individual plan/evaluator result, and writes one aggregate
 JSON file.  When no graph is supplied, the runner discovers and evaluates the
 100 ``case_*.json`` files under ``artifacts/data`` and displays case-level
-progress with tqdm.  Plotting is intentionally a separate backend-specific
+progress with tqdm; batch mode writes only each case's own artifacts and no
+cross-case summary.  Plotting is intentionally a separate backend-specific
 step.
 
 Example::
@@ -139,6 +140,8 @@ def evaluate(
     graph_path = graph_path.resolve()
     config_path = config_path.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    simulator_output_dir = output_dir / "output"
+    simulator_output_dir.mkdir(parents=True, exist_ok=True)
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     algorithm = _load_callable(algorithm_spec)
     repo_root = Path(__file__).resolve().parents[1]
@@ -158,7 +161,9 @@ def evaluate(
         for problem in problems:
             scenario = f"q{problem}"
             evaluator = evaluator_dir / f"multicore_cut_evaluate_problem_{problem}.py"
-            result_path = output_dir / f"result_{scenario}_{num_cores}cores.json"
+            # Keep official evaluator artifacts separate from this tool's
+            # plans, aggregate, and figures in the case directory itself.
+            result_path = simulator_output_dir / f"result_{scenario}_{num_cores}cores.json"
             result, stdout = _run_evaluator(
                 evaluator,
                 graph_path,
@@ -239,35 +244,36 @@ def evaluate_cases(
     make_plots: bool = False,
     workers: int = DEFAULT_WORKERS,
 ) -> dict[str, Any]:
-    """Evaluate cases concurrently and write a batch summary."""
+    """Evaluate cases concurrently, keeping only per-case output artifacts."""
     if workers < 1:
         raise ValueError("workers must be at least 1")
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     case_results: list[dict[str, Any] | None] = [None] * len(graph_paths)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {}
-        for index, graph_path in enumerate(graph_paths):
-            case_output_dir = output_dir / graph_path.stem
-            case_config = config_path or graph_path.parent / "config.txt"
-            future = executor.submit(
-                evaluate,
-                graph_path,
-                algorithm_spec,
-                case_config,
-                case_output_dir,
-                cores,
-                problems,
-            )
-            futures[future] = (index, graph_path, case_output_dir)
-
-        progress = tqdm(
-            total=len(futures),
-            desc="Evaluating cases",
-            unit="case",
-            dynamic_ncols=True,
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = {}
+    for index, graph_path in enumerate(graph_paths):
+        case_output_dir = output_dir / graph_path.stem
+        case_config = config_path or graph_path.parent / "config.txt"
+        future = executor.submit(
+            evaluate,
+            graph_path,
+            algorithm_spec,
+            case_config,
+            case_output_dir,
+            cores,
+            problems,
         )
+        futures[future] = (index, graph_path, case_output_dir)
+
+    progress = tqdm(
+        total=len(futures),
+        desc="Evaluating cases",
+        unit="case",
+        dynamic_ncols=True,
+    )
+    try:
         for future in as_completed(futures):
             index, graph_path, case_output_dir = futures[future]
             progress.set_postfix_str(graph_path.stem)
@@ -295,14 +301,22 @@ def evaluate_cases(
                 }
             finally:
                 progress.update()
+    except KeyboardInterrupt:
+        # Do not wait for the remaining subprocesses after Ctrl-C.  Completed
+        # cases and their per-case artifacts are already persisted above.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    finally:
         progress.close()
 
     cases = [item for item in case_results if item is not None]
-
     successful = sum(item["status"] == "ok" for item in cases)
-    batch = {
+    return {
         "algorithm": algorithm_spec,
         "case_count": len(cases),
+        "requested_case_count": len(graph_paths),
         "successful": successful,
         "failed": len(cases) - successful,
         "workers": workers,
@@ -310,12 +324,6 @@ def evaluate_cases(
         "problems": list(problems),
         "cases": cases,
     }
-    summary_path = output_dir / "batch_aggregate.json"
-    summary_path.write_text(
-        json.dumps(batch, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return batch
 
 
 def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
@@ -501,13 +509,6 @@ def main(argv: list[str] | None = None) -> int:
             make_plots=args.plot is True,
             workers=args.workers,
         )
-        print(json.dumps({
-            "batch_aggregate": str(output_dir / "batch_aggregate.json"),
-            "case_count": batch["case_count"],
-            "successful": batch["successful"],
-            "failed": batch["failed"],
-            "workers": batch["workers"],
-        }, ensure_ascii=False))
         return 1 if batch["failed"] else 0
 
     output_dir = args.output_dir or Path("results") / args.graph.stem

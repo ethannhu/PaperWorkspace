@@ -156,6 +156,23 @@ def _semantic_affinity(left: NodeFeature, right: NodeFeature) -> float:
     return 0.0
 
 
+def _explicit_stage_pair(left: NodeFeature, right: NodeFeature) -> bool:
+    """Return whether a cross-resource edge is an intentional stage boundary."""
+    if left.role == "COMPUTE" and right.role == "ELEMENTWISE":
+        return True
+    if left.role == "REDUCTION" and right.role in {"ELEMENTWISE", "REDUCTION"}:
+        return True
+    if left.role == "COMMUNICATION" and right.role == "COMPUTE":
+        return True
+    # Keep the hardware-oriented MTE -> Cube -> MTE motif available for graphs
+    # that expose MOVE/COPY-like stages as ordinary operations.
+    return (
+        left.pipe in {"PIPE_MTE2", "PIPE_MTE3"} and right.pipe == "PIPE_M"
+    ) or (
+        left.pipe == "PIPE_M" and right.pipe in {"PIPE_MTE2", "PIPE_MTE3"}
+    )
+
+
 def _merge_score(
     left: SemanticBlock,
     right: SemanticBlock,
@@ -170,6 +187,13 @@ def _merge_score(
         return float("-inf")
     tail = features[left.nodes[-1]]
     head = features[right.nodes[0]]
+    # An elementwise producer normally feeds many independent compute tiles.
+    # Fusing it into the first tile serializes that producer with the cube
+    # stage and can move the tile to the end of the task priority order.
+    if tail.role == "ELEMENTWISE" and head.role == "COMPUTE":
+        return float("-inf")
+    if tail.pipe != head.pipe and not _explicit_stage_pair(tail, head):
+        return float("-inf")
     # The byte term is normalized so a large tensor strongly favors avoiding a
     # writeback, while tiny edges still need semantic affinity to merge.
     communication_saved = min(6.0, edge_bytes / 1024.0)

@@ -57,6 +57,30 @@ class Partition:
     succs: set[int] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class CandidateDiagnostics:
+    """Static diagnostics for one hypothetical partition placement."""
+
+    partition_id: int | None
+    candidate_core: int | None
+    cross_core_edge_bytes: int
+    critical_cross_core_edges: tuple[dict[str, Any], ...]
+    per_core_compute_load: dict[int, int]
+    per_core_partition_count: dict[int, int]
+    objective_end: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "partition_id": self.partition_id,
+            "candidate_core": self.candidate_core,
+            "cross_core_edge_bytes": self.cross_core_edge_bytes,
+            "critical_cross_core_edges": [dict(edge) for edge in self.critical_cross_core_edges],
+            "per_core_compute_load": dict(self.per_core_compute_load),
+            "per_core_partition_count": dict(self.per_core_partition_count),
+            "objective_end": self.objective_end,
+        }
+
+
 def classify_op(op_type: str) -> str:
     if op_type in {"MATMUL", "CONV"}:
         return "DENSE_COMPUTE"
@@ -211,11 +235,22 @@ def _edge_size(features: GraphFeatures, source: int, target: int) -> int:
     return features.edge_sizes.get((source, target), 0)
 
 
-def build_partitions(features: GraphFeatures, max_ops: int = 16, max_cycles: int = 20000) -> list[Partition]:
-    """Build partitions with the semantic partitioner."""
-    from .semantic_partition import semantic_partition
+def build_partitions(
+    features: GraphFeatures,
+    max_ops: int = 16,
+    max_cycles: int = 20000,
+    algorithm: str = "semantic",
+) -> list[Partition]:
+    """Build partitions with a selectable partitioning implementation."""
+    if algorithm == "semantic":
+        from .semantic_partition import semantic_partition
 
-    return semantic_partition(features, max_ops=max_ops, max_cycles=max_cycles)
+        return semantic_partition(features, max_ops=max_ops, max_cycles=max_cycles)
+    if algorithm == "naive":
+        from .naive_partition import naive_partition
+
+        return naive_partition(features, max_ops=max_ops, max_cycles=max_cycles)
+    raise ValueError("partition algorithm must be 'semantic' or 'naive'")
 
 
 def _partition_topology(partitions: list[Partition]) -> list[int]:
@@ -224,12 +259,68 @@ def _partition_topology(partitions: list[Partition]) -> list[int]:
     return _topological_order([p.id for p in partitions], preds, succs)
 
 
+def _candidate_diagnostics(
+    partitions: list[Partition],
+    features: GraphFeatures,
+    core_of: dict[int, int],
+    num_cores: int,
+    partition_id: int | None = None,
+    candidate_core: int | None = None,
+    objective_end: float | None = None,
+) -> CandidateDiagnostics:
+    """Measure communication and load for a complete or partial placement."""
+    cross_core_edges: list[dict[str, Any]] = []
+    cross_core_edge_bytes = 0
+    for source in partitions:
+        if source.id not in core_of:
+            continue
+        for target_id in sorted(source.succs):
+            if target_id not in core_of or core_of[target_id] == core_of[source.id]:
+                continue
+            target = partitions[target_id]
+            edge_bytes = _partition_transfer_bytes(features, source, target)
+            criticality = max(source.rank_u, target.rank_u)
+            cross_core_edge_bytes += edge_bytes
+            cross_core_edges.append({
+                "source_partition": source.id,
+                "target_partition": target.id,
+                "source_core": core_of[source.id],
+                "target_core": core_of[target.id],
+                "bytes": edge_bytes,
+                "criticality": criticality,
+            })
+    cross_core_edges.sort(
+        key=lambda edge: (-edge["bytes"], -edge["criticality"],
+                          edge["source_partition"], edge["target_partition"])
+    )
+    compute_load = {core: 0 for core in range(num_cores)}
+    partition_count = {core: 0 for core in range(num_cores)}
+    by_id = {partition.id: partition for partition in partitions}
+    for pid, core in core_of.items():
+        compute_load[core] += by_id[pid].cycles
+        partition_count[core] += 1
+    return CandidateDiagnostics(
+        partition_id=partition_id,
+        candidate_core=candidate_core,
+        cross_core_edge_bytes=cross_core_edge_bytes,
+        # Keep the report compact while retaining the heaviest and most
+        # critical communication boundaries for each candidate.
+        critical_cross_core_edges=tuple(cross_core_edges[:10]),
+        per_core_compute_load=compute_load,
+        per_core_partition_count=partition_count,
+        objective_end=objective_end,
+    )
+
+
 def schedule_partitions(
     partitions: list[Partition],
     features: GraphFeatures,
     num_cores: int,
     scenario: str = "q2",
-) -> tuple[dict[int, int], list[list[int]]]:
+    return_diagnostics: bool = False,
+) -> tuple[dict[int, int], list[list[int]]] | tuple[
+    dict[int, int], list[list[int]], dict[str, Any]
+]:
     """Critical-path-first list schedule for identical cores."""
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
@@ -252,6 +343,7 @@ def schedule_partitions(
     cross_core_wait = 1000
     core_pipe_load: list[dict[str, int]] = [dict() for _ in range(num_cores)]
     estimated_ddr_bytes = 0
+    candidate_diagnostics: list[dict[str, Any]] = []
 
     while ready:
         ready.sort(key=lambda pid: (-by_id[pid].rank_u, topo_position[pid]))
@@ -290,6 +382,20 @@ def schedule_partitions(
             # The lower bound cannot be hidden below the compute estimate.
             objective_end = max(float(end), ddr_lb)
             choice = (objective_end, pipe_imbalance, max_pipe_load, end, core)
+            if return_diagnostics:
+                candidate_core_of = dict(core_of)
+                candidate_core_of[pid] = core
+                candidate_diagnostics.append(
+                    _candidate_diagnostics(
+                        partitions,
+                        features,
+                        candidate_core_of,
+                        num_cores,
+                        partition_id=pid,
+                        candidate_core=core,
+                        objective_end=objective_end,
+                    ).as_dict()
+                )
             if best is None or choice < best:
                 best = choice
         assert best is not None
@@ -311,7 +417,18 @@ def schedule_partitions(
             remaining[successor] -= 1
             if remaining[successor] == 0:
                 ready.append(successor)
-    return core_of, core_orders
+    if not return_diagnostics:
+        return core_of, core_orders
+    selected = _candidate_diagnostics(
+        partitions,
+        features,
+        core_of,
+        num_cores,
+    ).as_dict()
+    return core_of, core_orders, {
+        "candidates": candidate_diagnostics,
+        "selected": selected,
+    }
 
 
 def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, source: int, target: int) -> int:
@@ -323,10 +440,52 @@ def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, s
     )
 
 
-def build_plan(graph: dict[str, Any], num_cores: int = 4, scenario: str = "q2") -> dict[str, Any]:
+def _partition_transfer_bytes(
+    features: GraphFeatures,
+    source: Partition,
+    target: Partition,
+) -> int:
+    """Sum each tensor crossing a partition pair once.
+
+    A tensor can feed several operations in the destination partition.  The
+    evaluator transfers that tensor once per remote task, so counting every
+    operation pair would overstate the communication volume.
+    """
+    total = 0
+    for tensor_id, tensor in features.tensor_by_id.items():
+        produced_by_source = any(
+            tensor_id in features.output_tensors.get(op_id, set())
+            for op_id in source.ops
+        )
+        consumed_by_target = any(
+            tensor_id in features.input_tensors.get(op_id, set())
+            for op_id in target.ops
+        )
+        if produced_by_source and consumed_by_target:
+            total += int(tensor.get("size", 0))
+    return total
+
+
+def build_plan(
+    graph: dict[str, Any],
+    num_cores: int = 4,
+    scenario: str = "q2",
+    include_diagnostics: bool = False,
+    partition_algorithm: str = "semantic",
+) -> dict[str, Any]:
     features = analyze_graph(graph)
-    partitions = build_partitions(features)
-    core_of, core_orders = schedule_partitions(partitions, features, num_cores, scenario)
+    partitions = build_partitions(features, algorithm=partition_algorithm)
+    scheduled = schedule_partitions(
+        partitions,
+        features,
+        num_cores,
+        scenario,
+        return_diagnostics=include_diagnostics,
+    )
+    if include_diagnostics:
+        core_of, core_orders, diagnostics = scheduled
+    else:
+        core_of, core_orders = scheduled
     node_to_subgraph = {
         str(op_id): partition.id
         for partition in partitions
@@ -334,10 +493,13 @@ def build_plan(graph: dict[str, Any], num_cores: int = 4, scenario: str = "q2") 
     }
     # The scheduler emits partition ids in each core's critical-path order.
     # Empty cores are intentionally retained in the output.
-    return {
+    plan: dict[str, Any] = {
         "node_to_subgraph": node_to_subgraph,
         "core_schedules": core_orders,
     }
+    if include_diagnostics:
+        plan["diagnostics"] = diagnostics
+    return plan
 
 
 def load_graph(path: Path) -> dict[str, Any]:
@@ -353,15 +515,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("graph", type=Path)
     parser.add_argument("-n", "--num-cores", type=int, default=4)
     parser.add_argument("--scenario", choices=("q1", "q2", "q3"), default="q2")
+    parser.add_argument(
+        "--partition-algorithm",
+        choices=("semantic", "naive"),
+        default="semantic",
+        help="分组算法；默认 semantic，可选历史朴素算法 naive",
+    )
     parser.add_argument("-o", "--output", type=Path)
+    parser.add_argument(
+        "--diagnostics-output",
+        type=Path,
+        help="额外输出候选方案诊断 JSON；不改变标准方案文件格式",
+    )
     args = parser.parse_args(argv)
     graph = load_graph(args.graph)
-    plan = build_plan(graph, args.num_cores, args.scenario)
+    plan = build_plan(
+        graph,
+        args.num_cores,
+        args.scenario,
+        include_diagnostics=args.diagnostics_output is not None,
+        partition_algorithm=args.partition_algorithm,
+    )
+    diagnostics = plan.pop("diagnostics", None)
     output = args.output or args.graph.with_name(f"{args.graph.stem}_multicore_res.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as stream:
         json.dump(plan, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
+    if args.diagnostics_output is not None and diagnostics is not None:
+        args.diagnostics_output.parent.mkdir(parents=True, exist_ok=True)
+        with args.diagnostics_output.open("w", encoding="utf-8") as stream:
+            json.dump(diagnostics, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
     print(
         f"OK: scenario={args.scenario}, ops={len(plan['node_to_subgraph'])}, "
         f"subgraphs={len({*plan['node_to_subgraph'].values()})}, output={output}"
