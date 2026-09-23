@@ -263,10 +263,10 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
     pdf_path = base.with_suffix(".pdf")
     png_path = base.with_suffix(".png")
     tiff_path = base.with_suffix(".tiff")
-    fig.savefig(svg_path, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
+    # fig.savefig(svg_path, bbox_inches="tight")
+    # fig.savefig(pdf_path, bbox_inches="tight")
     fig.savefig(png_path, dpi=600, bbox_inches="tight")
-    fig.savefig(tiff_path, dpi=600, bbox_inches="tight")
+    # fig.savefig(tiff_path, dpi=600, bbox_inches="tight")
     outputs = [svg_path, pdf_path, png_path, tiff_path]
     plt.close(fig)
 
