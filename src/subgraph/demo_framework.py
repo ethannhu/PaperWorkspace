@@ -1,25 +1,28 @@
-"""A small, deterministic graph partitioning and multicore scheduling framework.
+"""Planning pipeline for graph partitioning and multicore scheduling.
 
 The framework deliberately stops at the contest output boundary.  It does not
 create COPY operations or simulate the NPU; the official evaluators do that.
 The implementation is intentionally plain:
 
 * Kahn topological sort for graph analysis;
-* one-pass linear fusion of elementwise operators;
 * critical-path-first list scheduling on identical cores.
 
-This is a useful baseline for all three questions.  ``scenario`` only changes
-the communication penalty used while assigning partitions to cores.
+Partitioners, schedulers, and optional schedule optimizers are injected as
+ordinary callables.  The default pipeline uses the semantic partitioner and
+the built-in list scheduler.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from .interfaces import AlgorithmResult, Partitioner, ScheduleOptimizer, Scheduler
 
 
 COPY_TYPES = {"COPY_IN", "COPY_OUT"}
@@ -239,18 +242,14 @@ def build_partitions(
     features: GraphFeatures,
     max_ops: int = 16,
     max_cycles: int = 20000,
-    algorithm: str = "semantic",
+    partitioner: Partitioner | None = None,
 ) -> list[Partition]:
-    """Build partitions with a selectable partitioning implementation."""
-    if algorithm == "semantic":
+    """Run the supplied partitioner, defaulting to the semantic partitioner."""
+    if partitioner is None:
         from .semantic_partition import semantic_partition
 
-        return semantic_partition(features, max_ops=max_ops, max_cycles=max_cycles)
-    if algorithm == "naive":
-        from .naive_partition import naive_partition
-
-        return naive_partition(features, max_ops=max_ops, max_cycles=max_cycles)
-    raise ValueError("partition algorithm must be 'semantic' or 'naive'")
+        partitioner = semantic_partition
+    return partitioner(features, max_ops, max_cycles)
 
 
 def _partition_topology(partitions: list[Partition]) -> list[int]:
@@ -571,7 +570,7 @@ def _proxy_schedule_objective(
     return max(finish.values(), default=0), traffic, max(loads, default=0) - min(loads, default=0)
 
 
-def _local_search(
+def optimize_schedule_move_swap(
     partitions: list[Partition],
     features: GraphFeatures,
     core_of: dict[int, int],
@@ -671,61 +670,39 @@ def _local_search(
     }
 
 
-LOCAL_SEARCH_ALGORITHMS = {
-    "none": None,
-    "move_swap": _local_search,
-}
-
-
 def build_plan(
     graph: dict[str, Any],
     num_cores: int = 4,
     scenario: str = "q2",
-    include_diagnostics: bool = False,
-    partition_algorithm: str = "semantic",
-    local_search_algorithm: str = "none",
-    local_search_iterations: int = 4,
-    local_search: bool | None = None,
-) -> dict[str, Any]:
-    # Keep the old boolean as a compatibility alias while making the named
-    # strategy the primary, pluggable interface.
-    if local_search is not None:
-        local_search_algorithm = "move_swap" if local_search else "none"
-    if local_search_algorithm not in LOCAL_SEARCH_ALGORITHMS:
-        available = ", ".join(sorted(LOCAL_SEARCH_ALGORITHMS))
-        raise ValueError(f"unknown local search algorithm: {local_search_algorithm}; available: {available}")
+    partitioner: Partitioner | None = None,
+    scheduler: Scheduler | None = None,
+    schedule_optimizer: ScheduleOptimizer | None = None,
+    optimizer_iterations: int = 4,
+) -> AlgorithmResult:
+    """Build a plan from independently replaceable algorithm stages."""
+    if scheduler is None:
+        scheduler = schedule_partitions
     features = analyze_graph(graph)
-    partitions = build_partitions(features, algorithm=partition_algorithm)
-    scheduled = schedule_partitions(
+    partitions = build_partitions(features, partitioner=partitioner)
+    scheduled = scheduler(
         partitions,
         features,
         num_cores,
         scenario,
-        return_diagnostics=include_diagnostics,
+        return_diagnostics=True,
     )
-    if include_diagnostics:
-        core_of, core_orders, diagnostics = scheduled
-    else:
-        core_of, core_orders = scheduled
-    search_diagnostics = {
-        "algorithm": local_search_algorithm,
-        "iterations": 0,
-        "moves": 0,
-        "enabled": local_search_algorithm != "none",
-    }
-    search_algorithm = LOCAL_SEARCH_ALGORITHMS[local_search_algorithm]
-    if search_algorithm is not None:
-        core_of, core_orders, search_diagnostics = search_algorithm(
+    core_of, core_orders, scheduler_diagnostics = scheduled
+    optimizer_diagnostics = {"enabled": schedule_optimizer is not None, "iterations": 0, "moves": 0}
+    if schedule_optimizer is not None:
+        core_of, core_orders, optimizer_diagnostics = schedule_optimizer(
             partitions,
             features,
             core_of,
             core_orders,
             num_cores,
             scenario,
-            max_iterations=local_search_iterations,
+            max_iterations=optimizer_iterations,
         )
-        search_diagnostics.setdefault("algorithm", local_search_algorithm)
-        search_diagnostics.setdefault("enabled", True)
     node_to_subgraph = {
         str(op_id): partition.id
         for partition in partitions
@@ -733,14 +710,16 @@ def build_plan(
     }
     # The scheduler emits partition ids in each core's critical-path order.
     # Empty cores are intentionally retained in the output.
-    plan: dict[str, Any] = {
-        "node_to_subgraph": node_to_subgraph,
-        "core_schedules": core_orders,
-    }
-    if include_diagnostics:
-        plan["diagnostics"] = diagnostics
-        plan["diagnostics"]["local_search"] = search_diagnostics
-    return plan
+    return AlgorithmResult(
+        plan={
+            "node_to_subgraph": node_to_subgraph,
+            "core_schedules": core_orders,
+        },
+        diagnostics={
+            "scheduler": scheduler_diagnostics,
+            "schedule_optimizer": optimizer_diagnostics,
+        },
+    )
 
 
 def load_graph(path: Path) -> dict[str, Any]:
@@ -757,44 +736,53 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-n", "--num-cores", type=int, default=4)
     parser.add_argument("--scenario", choices=("q1", "q2", "q3"), default="q2")
     parser.add_argument(
-        "--partition-algorithm",
-        choices=("semantic", "naive"),
-        default="semantic",
-        help="分组算法；默认 semantic，可选历史朴素算法 naive",
+        "--partitioner",
+        default="subgraph.semantic_partition:semantic_partition",
+        help="partitioner 的 module:callable；默认使用 semantic_partition",
     )
     parser.add_argument(
-        "--local-search",
-        choices=tuple(LOCAL_SEARCH_ALGORITHMS),
-        default="none",
-        help="局部搜索策略；默认关闭，可选 move_swap",
+        "--scheduler",
+        default="subgraph.demo_framework:schedule_partitions",
+        help="scheduler 的 module:callable；默认使用 schedule_partitions",
+    )
+    parser.add_argument(
+        "--schedule-optimizer",
+        help="可选 schedule optimizer 的 module:callable",
     )
     parser.add_argument("-o", "--output", type=Path)
-    parser.add_argument(
-        "--diagnostics-output",
-        type=Path,
-        help="额外输出候选方案诊断 JSON；不改变标准方案文件格式",
-    )
     args = parser.parse_args(argv)
     graph = load_graph(args.graph)
-    plan = build_plan(
+
+    def load_callable(spec: str, name: str) -> Any:
+        if ":" not in spec:
+            raise ValueError(f"{name} must use module:callable syntax")
+        module_name, function_name = spec.split(":", 1)
+        target = getattr(importlib.import_module(module_name), function_name, None)
+        if not callable(target):
+            raise TypeError(f"{name} is not callable: {spec}")
+        return target
+
+    partitioner = load_callable(args.partitioner, "partitioner")
+    scheduler = load_callable(args.scheduler, "scheduler")
+    schedule_optimizer = (
+        load_callable(args.schedule_optimizer, "schedule optimizer")
+        if args.schedule_optimizer
+        else None
+    )
+    result = build_plan(
         graph,
         args.num_cores,
         args.scenario,
-        include_diagnostics=args.diagnostics_output is not None,
-        partition_algorithm=args.partition_algorithm,
-        local_search_algorithm=args.local_search,
+        partitioner=partitioner,
+        scheduler=scheduler,
+        schedule_optimizer=schedule_optimizer,
     )
-    diagnostics = plan.pop("diagnostics", None)
+    plan = result.plan
     output = args.output or args.graph.with_name(f"{args.graph.stem}_multicore_res.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as stream:
         json.dump(plan, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
-    if args.diagnostics_output is not None and diagnostics is not None:
-        args.diagnostics_output.parent.mkdir(parents=True, exist_ok=True)
-        with args.diagnostics_output.open("w", encoding="utf-8") as stream:
-            json.dump(diagnostics, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
     print(
         f"OK: scenario={args.scenario}, ops={len(plan['node_to_subgraph'])}, "
         f"subgraphs={len({*plan['node_to_subgraph'].values()})}, output={output}"
