@@ -7,7 +7,7 @@ JSON file.  Plotting is intentionally a separate backend-specific step.
 
 Example::
 
-    PYTHONPATH=src python tools/evaluate_multicore.py \
+    PYTHONPATH=src uv run tools/evaluate_multicore.py \
         artifacts/data/case_001.json \
         --algorithm subgraph.demo_framework:build_plan \
         --config artifacts/data/config.txt \
