@@ -26,6 +26,7 @@ import argparse
 import importlib
 import inspect
 import json
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -206,14 +207,23 @@ def evaluate(
 
 
 def discover_cases(cases_dir: Path, case_count: int = DEFAULT_CASE_COUNT) -> list[Path]:
-    """Return the first ``case_count`` zero-padded challenge cases."""
+    """Return only input graphs named exactly ``case_<number>.json``.
+
+    Evaluators may leave files such as ``case_001_problem_1_trace.json`` in
+    the same directory.  A broad ``case_*.json`` glob would incorrectly treat
+    those artifacts as additional graph inputs.
+    """
     if case_count < 1:
         raise ValueError("case_count must be at least 1")
     cases_dir = cases_dir.resolve()
-    graph_paths = sorted(cases_dir.glob("case_*.json"))
+    graph_paths = sorted(
+        path
+        for path in cases_dir.glob("case_*.json")
+        if re.fullmatch(r"case_[0-9]+\.json", path.name)
+    )
     if len(graph_paths) < case_count:
         raise FileNotFoundError(
-            f"expected at least {case_count} case_*.json files in {cases_dir}, "
+            f"expected at least {case_count} case_<number>.json files in {cases_dir}, "
             f"found {len(graph_paths)}"
         )
     return graph_paths[:case_count]
