@@ -15,6 +15,7 @@ testable without coupling its scoring rules to scheduling code.
 from __future__ import annotations
 
 import heapq
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -226,6 +227,198 @@ def _merge(left: SemanticBlock, right: SemanticBlock, motif: str) -> None:
     left.pipelineability = max(left.pipelineability, right.pipelineability)
 
 
+def _owner_map(blocks: dict[int, SemanticBlock]) -> dict[int, int]:
+    return {node: block.id for block in blocks.values() for node in block.nodes}
+
+
+def _edges_between(
+    features: GraphFeatures,
+    left: SemanticBlock,
+    right: SemanticBlock,
+) -> list[tuple[int, int]]:
+    right_nodes = set(right.nodes)
+    return [
+        (source, target)
+        for source in left.nodes
+        for target in features.succs[source]
+        if target in right_nodes
+    ]
+
+
+def _crossing_bytes(
+    features: GraphFeatures,
+    left: SemanticBlock,
+    right: SemanticBlock,
+    edge_pairs: list[tuple[int, int]] | None = None,
+) -> int:
+    if edge_pairs is None:
+        edge_pairs = _edges_between(features, left, right)
+    return sum(features.edge_sizes.get(edge, 0) for edge in edge_pairs)
+
+
+def _would_create_partition_cycle(
+    features: GraphFeatures,
+    left: SemanticBlock,
+    right: SemanticBlock,
+) -> bool:
+    """Detect non-convex merges that would create a cycle in the block DAG."""
+    candidate = set(left.nodes) | set(right.nodes)
+    seen: set[int] = set()
+    stack = [
+        successor
+        for node in candidate
+        for successor in features.succs[node]
+        if successor not in candidate
+    ]
+    while stack:
+        node = stack.pop()
+        if node in candidate:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(features.succs[node])
+    return False
+
+
+def _singleton_repair_score(
+    left: SemanticBlock,
+    right: SemanticBlock,
+    graph_features: GraphFeatures,
+    node_features: dict[int, NodeFeature],
+    max_ops: int,
+    max_cycles: int,
+) -> float:
+    """Score a conservative repair merge after the strict motif pass.
+
+    This pass is intentionally more permissive about fan-in/fan-out than
+    ``_merge_blocks`` but still prices the parallelism loss.  It is meant to
+    clean up isolated one-op blocks around otherwise obvious stage patterns.
+    """
+    if len(left.nodes) + len(right.nodes) > max_ops:
+        return float("-inf")
+    if left.cycles + right.cycles > max_cycles:
+        return float("-inf")
+
+    edge_pairs = _edges_between(graph_features, left, right)
+    if not edge_pairs:
+        return float("-inf")
+
+    # Use the strongest touching edge as the semantic representative, while
+    # communication reward accounts for every tensor crossing the block pair.
+    source, target = max(
+        edge_pairs,
+        key=lambda edge: graph_features.edge_sizes.get(edge, 0),
+    )
+    tail = node_features[source]
+    head = node_features[target]
+    if tail.role == "ELEMENTWISE" and head.role == "COMPUTE":
+        return float("-inf")
+    if tail.pipe != head.pipe and not _explicit_stage_pair(tail, head):
+        return float("-inf")
+    if _would_create_partition_cycle(graph_features, left, right):
+        return float("-inf")
+
+    edge_bytes = _crossing_bytes(graph_features, left, right, edge_pairs)
+    communication_saved = 2.0 * math.log1p(edge_bytes / 1024.0)
+    locality_gain = 1.5 if left.output_tensors & right.input_tensors else 0.0
+    semantic_gain = max(
+        _semantic_affinity(node_features[src], node_features[dst])
+        for src, dst in edge_pairs
+    )
+    singleton_gain = 1.0 if len(left.nodes) == 1 or len(right.nodes) == 1 else 0.0
+    resource_diversity = 0.8 if tail.pipe != head.pipe else -0.2
+
+    # Fan-in/fan-out still matter, but this pass should not treat every join as
+    # an absolute wall.  Large tensor reuse and strong semantics can buy through
+    # a modest structural penalty.
+    fan_loss = math.log2(1 + max(0, tail.outdegree - 1) + max(0, head.indegree - 1))
+    boundary_penalty = 0.35 * (tail.boundary_score + head.boundary_score)
+    serial_penalty = 0.5 if tail.role == head.role == "COMPUTE" else 0.0
+    return (
+        communication_saved
+        + locality_gain
+        + semantic_gain
+        + singleton_gain
+        + resource_diversity
+        - fan_loss
+        - boundary_penalty
+        - serial_penalty
+    )
+
+
+def _repair_singleton_blocks(
+    features: GraphFeatures,
+    blocks: dict[int, SemanticBlock],
+    node_features: dict[int, NodeFeature],
+    max_ops: int,
+    max_cycles: int,
+) -> None:
+    """Merge profitable singleton blocks left by the strict semantic pass."""
+    for _ in range(2):
+        owner = _owner_map(blocks)
+        changed = False
+        for node in features.topo_order:
+            block_id = owner.get(node)
+            if block_id not in blocks:
+                continue
+            block = blocks[block_id]
+            if len(block.nodes) != 1:
+                continue
+
+            candidates: list[tuple[float, int, int, str]] = []
+            for predecessor in sorted(features.preds[node]):
+                left_id = owner.get(predecessor)
+                if left_id is None or left_id == block_id or left_id not in blocks:
+                    continue
+                left = blocks[left_id]
+                score = _singleton_repair_score(
+                    left,
+                    block,
+                    features,
+                    node_features,
+                    max_ops,
+                    max_cycles,
+                )
+                candidates.append((score, left_id, block_id, "pred"))
+            for successor in sorted(features.succs[node]):
+                right_id = owner.get(successor)
+                if right_id is None or right_id == block_id or right_id not in blocks:
+                    continue
+                right = blocks[right_id]
+                score = _singleton_repair_score(
+                    block,
+                    right,
+                    features,
+                    node_features,
+                    max_ops,
+                    max_cycles,
+                )
+                candidates.append((score, block_id, right_id, "succ"))
+            if not candidates:
+                continue
+
+            score, left_id, right_id, _ = max(candidates, key=lambda item: item[0])
+            if score <= 0 or left_id not in blocks or right_id not in blocks:
+                continue
+
+            left = blocks[left_id]
+            right = blocks[right_id]
+            edge_pairs = _edges_between(features, left, right)
+            source, target = max(
+                edge_pairs,
+                key=lambda edge: features.edge_sizes.get(edge, 0),
+            )
+            _merge(left, right, _motif_type(node_features[source], node_features[target]))
+            for merged_node in right.nodes:
+                owner[merged_node] = left_id
+            del blocks[right_id]
+            changed = True
+
+        if not changed:
+            break
+
+
 def _build_stage_blocks(features: GraphFeatures) -> tuple[dict[int, SemanticBlock], dict[int, NodeFeature]]:
     node_features = extract_features(features)
     blocks = {node: _initial_block(feature) for node, feature in node_features.items()}
@@ -336,6 +529,7 @@ def semantic_partition(
         raise ValueError("partition limits must be positive")
     blocks, node_features = _build_stage_blocks(features)
     _merge_blocks(features, blocks, node_features, max_ops, max_cycles)
+    _repair_singleton_blocks(features, blocks, node_features, max_ops, max_cycles)
     return build_partition_dag(features, blocks)
 
 

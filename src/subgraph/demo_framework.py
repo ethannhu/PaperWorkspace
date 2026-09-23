@@ -61,6 +61,14 @@ class Partition:
 
 
 @dataclass(frozen=True)
+class PlanContext:
+    """Graph analysis and partitioning that can be reused across schedules."""
+
+    features: GraphFeatures
+    partitions: tuple[Partition, ...]
+
+
+@dataclass(frozen=True)
 class CandidateDiagnostics:
     """Static diagnostics for one hypothetical partition placement."""
 
@@ -250,6 +258,39 @@ def build_partitions(
 
         partitioner = semantic_partition
     return partitioner(features, max_ops, max_cycles)
+
+
+def _clone_partitions(partitions: Iterable[Partition]) -> list[Partition]:
+    """Return independent partition objects for one scheduler run."""
+    return [
+        Partition(
+            id=partition.id,
+            ops=list(partition.ops),
+            cycles=partition.cycles,
+            rank_u=partition.rank_u,
+            pipe_cycles=dict(partition.pipe_cycles),
+            preds=set(partition.preds),
+            succs=set(partition.succs),
+        )
+        for partition in partitions
+    ]
+
+
+def prepare_plan_context(
+    graph: dict[str, Any],
+    partitioner: Partitioner | None = None,
+    max_ops: int = 16,
+    max_cycles: int = 20000,
+) -> PlanContext:
+    """Analyze and partition a graph once for repeated scheduling calls."""
+    features = analyze_graph(graph)
+    partitions = build_partitions(
+        features,
+        max_ops=max_ops,
+        max_cycles=max_cycles,
+        partitioner=partitioner,
+    )
+    return PlanContext(features=features, partitions=tuple(partitions))
 
 
 def _partition_topology(partitions: list[Partition]) -> list[int]:
@@ -678,12 +719,18 @@ def build_plan(
     scheduler: Scheduler | None = None,
     schedule_optimizer: ScheduleOptimizer | None = None,
     optimizer_iterations: int = 4,
+    features: GraphFeatures | None = None,
+    partitions: Iterable[Partition] | None = None,
 ) -> AlgorithmResult:
     """Build a plan from independently replaceable algorithm stages."""
     if scheduler is None:
         scheduler = schedule_partitions
-    features = analyze_graph(graph)
-    partitions = build_partitions(features, partitioner=partitioner)
+    if features is None:
+        features = analyze_graph(graph)
+    if partitions is None:
+        partitions = build_partitions(features, partitioner=partitioner)
+    else:
+        partitions = _clone_partitions(partitions)
     scheduled = scheduler(
         partitions,
         features,

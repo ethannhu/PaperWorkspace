@@ -63,6 +63,7 @@ def _call_algorithm(
     graph: dict[str, Any],
     num_cores: int,
     scenario: str,
+    reusable_context: dict[str, Any] | None = None,
 ) -> AlgorithmResult:
     """Call a plan builder with the common graph/core/scenario interface."""
     parameters = inspect.signature(algorithm).parameters
@@ -71,10 +72,36 @@ def _call_algorithm(
         kwargs["num_cores"] = num_cores
     if "scenario" in parameters:
         kwargs["scenario"] = scenario
+    for name, value in (reusable_context or {}).items():
+        if name in parameters:
+            kwargs[name] = value
     result = algorithm(graph, **kwargs)
     if not isinstance(result, AlgorithmResult):
         raise TypeError("algorithm must return AlgorithmResult")
     return result
+
+
+def _prepare_reusable_context(
+    algorithm: Callable[..., AlgorithmResult],
+    graph: dict[str, Any],
+) -> dict[str, Any]:
+    """Build reusable analysis/partition inputs for algorithms that opt in."""
+    parameters = inspect.signature(algorithm).parameters
+    if "features" not in parameters and "partitions" not in parameters:
+        return {}
+    if "partitions" not in parameters:
+        from subgraph.demo_framework import analyze_graph
+
+        return {"features": analyze_graph(graph)}
+    from subgraph.demo_framework import prepare_plan_context
+
+    context = prepare_plan_context(graph)
+    reusable: dict[str, Any] = {}
+    if "features" in parameters:
+        reusable["features"] = context.features
+    if "partitions" in parameters:
+        reusable["partitions"] = context.partitions
+    return reusable
 
 
 def _run_evaluator(
@@ -148,6 +175,7 @@ def evaluate(
     simulator_output_dir.mkdir(parents=True, exist_ok=True)
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     algorithm = _load_callable(algorithm_spec)
+    reusable_context = _prepare_reusable_context(algorithm, graph)
     repo_root = Path(__file__).resolve().parents[1]
     evaluator_dir = repo_root / "artifacts" / "code"
 
@@ -162,6 +190,7 @@ def evaluate(
                 graph,
                 num_cores,
                 scenario,
+                reusable_context,
             )
             plan_path = input_dir / f"plan_{scenario}_{num_cores}cores.json"
             plan_path.write_text(json.dumps(result.plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
