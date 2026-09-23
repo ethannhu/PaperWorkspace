@@ -42,6 +42,8 @@ class GraphFeatures:
     depth: dict[int, int]
     rank_u: dict[int, int]
     semantic: dict[int, str]
+    input_tensors: dict[int, set[int]]
+    output_tensors: dict[int, set[int]]
 
 
 @dataclass
@@ -125,6 +127,15 @@ def analyze_graph(graph: dict[str, Any]) -> GraphFeatures:
     op_by_id = {op["id"]: op for op in graph.get("ops", [])}
     tensor_by_id = {tensor["id"]: tensor for tensor in graph.get("tensors", [])}
     preds, succs, edge_sizes = _op_graph(graph)
+    producers: dict[int, set[int]] = {}
+    consumers: dict[int, set[int]] = {}
+    op_ids = set(op_by_id)
+    for edge in graph.get("edges", []):
+        source, target = edge["source"], edge["target"]
+        if source in op_ids and target in tensor_by_id:
+            producers.setdefault(target, set()).add(source)
+        elif source in tensor_by_id and target in op_ids:
+            consumers.setdefault(source, set()).add(target)
     eligible = [op_id for op_id, op in op_by_id.items() if op.get("op") not in COPY_TYPES]
 
     # COPY nodes are boundaries, not user partitions.  Contract them by walking
@@ -171,6 +182,13 @@ def analyze_graph(graph: dict[str, Any]) -> GraphFeatures:
 
     # Return contracted dependencies for non-COPY operations.  The raw edge-size
     # lookup remains useful for direct edges; tensor edges are recovered below.
+    input_tensors = {node: set() for node in eligible}
+    output_tensors = {node: set() for node in eligible}
+    for tensor_id, source_ids in producers.items():
+        for source in source_ids & eligible_set:
+            output_tensors[source].add(tensor_id)
+            for target in consumers.get(tensor_id, set()) & eligible_set:
+                input_tensors[target].add(tensor_id)
     return GraphFeatures(
         op_by_id=op_by_id,
         tensor_by_id=tensor_by_id,
@@ -181,6 +199,8 @@ def analyze_graph(graph: dict[str, Any]) -> GraphFeatures:
         depth=depth,
         rank_u=rank_u,
         semantic={node: classify_op(op_by_id[node].get("op", "")) for node in eligible},
+        input_tensors=input_tensors,
+        output_tensors=output_tensors,
     )
 
 
@@ -192,50 +212,10 @@ def _edge_size(features: GraphFeatures, source: int, target: int) -> int:
 
 
 def build_partitions(features: GraphFeatures, max_ops: int = 16, max_cycles: int = 20000) -> list[Partition]:
-    """Fuse only a straight-line anchor -> elementwise suffix.
+    """Build partitions with the semantic partitioner."""
+    from .semantic_partition import semantic_partition
 
-    A node is attached to its predecessor's partition only when it is the sole
-    successor, has one predecessor, and does not create a large partition.  All
-    other nodes start a new partition.  This is intentionally conservative and
-    deterministic.
-    """
-    if max_ops < 1 or max_cycles < 1:
-        raise ValueError("partition limits must be positive")
-    partitions: list[Partition] = []
-    op_to_partition: dict[int, int] = {}
-    for node in features.topo_order:
-        op = features.op_by_id[node]
-        pred_ids = features.preds[node]
-        candidate = None
-        if len(pred_ids) == 1 and features.semantic[node] == "ELEMENTWISE":
-            pred = next(iter(pred_ids))
-            pred_partition = op_to_partition.get(pred)
-            if pred_partition is not None and len(features.succs[pred]) == 1:
-                p = partitions[pred_partition]
-                if len(p.ops) < max_ops and p.cycles + int(op.get("cycles", 0)) <= max_cycles:
-                    candidate = p
-        if candidate is None:
-            candidate = Partition(
-                id=len(partitions), ops=[], cycles=0, rank_u=features.rank_u[node]
-            )
-            partitions.append(candidate)
-        candidate.ops.append(node)
-        candidate.cycles += int(op.get("cycles", 0))
-        pipe = str(op.get("pipe", "UNKNOWN"))
-        candidate.pipe_cycles[pipe] = candidate.pipe_cycles.get(pipe, 0) + int(
-            op.get("cycles", 0)
-        )
-        candidate.rank_u = max(candidate.rank_u, features.rank_u[node])
-        op_to_partition[node] = candidate.id
-
-    for source in features.topo_order:
-        for target in features.succs[source]:
-            source_partition = op_to_partition[source]
-            target_partition = op_to_partition[target]
-            if source_partition != target_partition:
-                partitions[source_partition].succs.add(target_partition)
-                partitions[target_partition].preds.add(source_partition)
-    return partitions
+    return semantic_partition(features, max_ops=max_ops, max_cycles=max_cycles)
 
 
 def _partition_topology(partitions: list[Partition]) -> list[int]:
