@@ -15,8 +15,10 @@ diagnostics = result.diagnostics
 
 1. `analyze_graph(graph)` produces `GraphFeatures`.
 2. `partitioner(features, max_ops, max_cycles)` produces `list[Partition]`.
-3. `scheduler(partitions, features, num_cores, scenario, return_diagnostics=True)`
-   produces core placement, per-core order, and scheduler diagnostics.
+3. `scheduler(partitions, features, num_cores, scenario, return_diagnostics=False)`
+   produces core placement and per-core order. Expensive scheduler diagnostics
+   are collected only when `build_plan(..., collect_scheduler_diagnostics=True)`
+   is requested.
 
 An optional `schedule_optimizer` can refine the scheduler result. The complete
 algorithm result is an `AlgorithmResult` containing `plan` and `diagnostics`.

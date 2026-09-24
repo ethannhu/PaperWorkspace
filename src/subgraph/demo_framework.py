@@ -721,6 +721,7 @@ def build_plan(
     optimizer_iterations: int = 4,
     features: GraphFeatures | None = None,
     partitions: Iterable[Partition] | None = None,
+    collect_scheduler_diagnostics: bool = False,
 ) -> AlgorithmResult:
     """Build a plan from independently replaceable algorithm stages."""
     if scheduler is None:
@@ -736,9 +737,13 @@ def build_plan(
         features,
         num_cores,
         scenario,
-        return_diagnostics=True,
+        return_diagnostics=collect_scheduler_diagnostics,
     )
-    core_of, core_orders, scheduler_diagnostics = scheduled
+    if collect_scheduler_diagnostics:
+        core_of, core_orders, scheduler_diagnostics = scheduled
+    else:
+        core_of, core_orders = scheduled
+        scheduler_diagnostics = {"enabled": False}
     optimizer_diagnostics = {"enabled": schedule_optimizer is not None, "iterations": 0, "moves": 0}
     if schedule_optimizer is not None:
         core_of, core_orders, optimizer_diagnostics = schedule_optimizer(

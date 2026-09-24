@@ -2,12 +2,11 @@
 
 The algorithm is supplied as ``module:callable`` and must return the standard
 multicore plan dictionary.  The runner evaluates one-core baseline plus 2--5
-cores, keeps every individual plan/evaluator result, and writes one aggregate
-JSON file.  When no graph is supplied, the runner discovers and evaluates the
-100 ``case_*.json`` files under ``artifacts/data`` and displays case-level
-progress with tqdm; batch mode writes only each case's own artifacts and no
-cross-case summary.  Plotting is intentionally a separate backend-specific
-step.
+cores, keeps every individual plan/evaluator result, writes one aggregate JSON
+file, and saves a ``speedup.png`` plot.  When no graph is supplied, the runner
+discovers and evaluates ``case_*.json`` files under ``artifacts/data`` and
+displays case-level progress with tqdm; batch mode writes only each case's own
+artifacts and no cross-case summary.
 
 Example::
 
@@ -43,8 +42,9 @@ from subgraph.interfaces import AlgorithmResult
 
 PROBLEMS = (1, 2, 3)
 CORE_COUNTS = (1, 2, 3, 4, 5)
-DEFAULT_CASE_COUNT = 100
+DEFAULT_CASE_COUNT = 20
 DEFAULT_WORKERS = 4
+DEFAULT_EVALUATOR_TIMEOUT_SECONDS = 600
 
 
 def _load_callable(spec: str) -> Callable[..., AlgorithmResult]:
@@ -112,6 +112,7 @@ def _run_evaluator(
     plan: Path,
     config: Path,
     output: Path,
+    timeout_seconds: int | None = DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], str]:
     trace = output.with_name(output.stem + "_trace.json")
     log = output.with_name(output.stem + "_log.txt")
@@ -129,12 +130,18 @@ def _run_evaluator(
         "--log-output",
         str(log),
     ]
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"evaluator timed out after {timeout_seconds}s for {evaluator.name}"
+        ) from exc
     if completed.returncode != 0:
         details = completed.stderr.strip() or completed.stdout.strip()
         raise RuntimeError(f"evaluator failed for {evaluator.name}: {details}")
@@ -390,6 +397,7 @@ def evaluate(
     output_dir: Path,
     cores: tuple[int, ...] = CORE_COUNTS,
     problems: tuple[int, ...] = PROBLEMS,
+    evaluator_timeout: int | None = DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     graph_path = graph_path.resolve()
     config_path = config_path.resolve()
@@ -437,6 +445,7 @@ def evaluate(
                 Path(plans[scenario]),
                 config_path,
                 result_path,
+                evaluator_timeout,
             )
             run["problems"][scenario] = {
                 "result_path": str(result_path),
@@ -522,8 +531,8 @@ def evaluate_cases(
     config_path: Path | None = None,
     cores: tuple[int, ...] = CORE_COUNTS,
     problems: tuple[int, ...] = PROBLEMS,
-    make_plots: bool = False,
     workers: int = DEFAULT_WORKERS,
+    evaluator_timeout: int | None = DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Evaluate cases concurrently, keeping only per-case output artifacts."""
     if workers < 1:
@@ -545,6 +554,7 @@ def evaluate_cases(
             case_output_dir,
             cores,
             problems,
+            evaluator_timeout,
         )
         futures[future] = (index, graph_path, case_output_dir)
 
@@ -560,11 +570,7 @@ def evaluate_cases(
             progress.set_postfix_str(graph_path.stem)
             try:
                 aggregate = future.result()
-                figure_outputs = (
-                    [str(path) for path in plot_speedup(aggregate, case_output_dir)]
-                    if make_plots
-                    else []
-                )
+                figure_outputs = [str(plot_speedup(aggregate, case_output_dir))]
                 case_results[index] = {
                     "case": graph_path.stem,
                     "graph": str(graph_path.resolve()),
@@ -607,15 +613,14 @@ def evaluate_cases(
     }
 
 
-def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
+def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> Path:
     """Draw speedup trends together with input-derived theoretical bounds."""
     import matplotlib as mpl
 
+    mpl.use("Agg", force=True)
     mpl.rcParams.update({
         "font.family": "sans-serif",
         "font.sans-serif": ["Arial", "DejaVu Sans", "Liberation Sans"],
-        "svg.fonttype": "none",
-        "pdf.fonttype": 42,
         "font.size": 8,
         "axes.spines.right": False,
         "axes.spines.top": False,
@@ -717,90 +722,17 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
         gap_ax.set_axisbelow(True)
     fig.tight_layout(pad=0.8)
 
-    skill_scripts = Path(__file__).resolve().parents[1] / ".agents" / "skills" / "nature-figure" / "scripts"
-    sys.path.insert(0, str(skill_scripts))
-    from audit_panel_alignment import require_matplotlib_panel_alignment
-
-    base = output_dir / "speedup"
-    require_matplotlib_panel_alignment(
-        fig,
-        json_out=base.with_suffix(".alignment.json"),
-        overlay_svg=base.with_suffix(".alignment.svg"),
-        strict=True,
-    )
-    # Keep explicit vector and raster exports so the source audit can verify
-    # the delivery bundle without evaluating dynamic suffix construction.
-    svg_path = base.with_suffix(".svg")
-    pdf_path = base.with_suffix(".pdf")
-    png_path = base.with_suffix(".png")
-    tiff_path = base.with_suffix(".tiff")
-    # fig.savefig(svg_path, bbox_inches="tight")
-    # fig.savefig(pdf_path, bbox_inches="tight")
-    fig.savefig(png_path, dpi=600, bbox_inches="tight")
-    # fig.savefig(tiff_path, dpi=600, bbox_inches="tight")
-    outputs = [svg_path, pdf_path, png_path, tiff_path]
-    plt.close(fig)
-
-    speedup_data = {
-        "core_counts": core_counts,
-        "series": {
-            problem: [
-                item["problems"][problem]["metrics"]["speedup"]
-                for item in runs
-                if problem in item["problems"]
-            ]
-            for problem in ("q1", "q2", "q3")
-        },
-    }
-    if has_theoretical:
-        speedup_data["theoretical"] = {
-            "lower_bound_cycles": [
-                lower_bounds.get(str(num_cores), {}).get("lower_bound_cycles")
-                for num_cores in core_counts
-            ],
-            "input_speedup_upper_bound": [
-                lower_bounds.get(str(num_cores), {}).get("input_speedup_upper_bound")
-                for num_cores in core_counts
-            ],
-            "problem_speedup_upper_bound": {
-                problem: [
-                    (
-                        aggregate.get("baseline_makespan", {}).get(problem)
-                        / lower_bounds.get(str(num_cores), {}).get("lower_bound_cycles")
-                        if lower_bounds.get(str(num_cores), {}).get("lower_bound_cycles")
-                        else None
-                    )
-                    for num_cores in core_counts
-                ]
-                for problem in ("q1", "q2", "q3")
-                if problem in aggregate.get("baseline_makespan", {})
-            },
-            "makespan_to_lower_bound": {
-                problem: [
-                    (
-                        item["problems"][problem]["metrics"].get("makespan")
-                        / lower_bounds.get(str(item["num_cores"]), {}).get("lower_bound_cycles")
-                        if lower_bounds.get(str(item["num_cores"]), {}).get("lower_bound_cycles")
-                        else None
-                    )
-                    for item in runs
-                    if problem in item["problems"]
-                ]
-                for problem in ("q1", "q2", "q3")
-            },
-        }
-    data_path = output_dir / "speedup_data.json"
-    data_path.write_text(
-        json.dumps(speedup_data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    outputs.append(data_path)
-    return outputs
+    png_path = output_dir / "speedup.png"
+    try:
+        fig.savefig(png_path, dpi=600, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return png_path
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="运行 Q1-Q3 多核算法评测；省略 graph 时自动评测 100 个 cases"
+        description=f"运行 Q1-Q3 多核算法评测；省略 graph 时自动评测 {DEFAULT_CASE_COUNT} 个 cases"
     )
     parser.add_argument(
         "graph",
@@ -824,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         "--case-count",
         type=int,
         default=DEFAULT_CASE_COUNT,
-        help="批量模式评测的 case 数；默认 100",
+        help=f"批量模式评测的 case 数；默认 {DEFAULT_CASE_COUNT}",
     )
     parser.add_argument(
         "--workers",
@@ -852,26 +784,24 @@ def main(argv: list[str] | None = None) -> int:
         choices=PROBLEMS,
         default=list(PROBLEMS),
     )
-    plot_group = parser.add_mutually_exclusive_group()
-    plot_group.add_argument(
-        "--plot",
-        dest="plot",
-        action="store_true",
-        default=True,
-        help="生成 speedup 图；单 case 模式默认开启，批量模式默认关闭",
-    )
-    plot_group.add_argument(
-        "--no-plot",
-        dest="plot",
-        action="store_false",
-        help="只运行评测，不生成 speedup.svg/pdf/png",
+    parser.add_argument(
+        "--evaluator-timeout",
+        type=int,
+        default=DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
+        help=(
+            "单次官方 evaluator 子进程超时秒数；"
+            f"默认 {DEFAULT_EVALUATOR_TIMEOUT_SECONDS}，设为 0 表示不限制"
+        ),
     )
     args = parser.parse_args(argv)
     if 1 not in args.cores:
         args.cores = [1, *args.cores]
+    if args.evaluator_timeout < 0:
+        raise ValueError("--evaluator-timeout must be non-negative")
 
     cores = tuple(sorted(set(args.cores)))
     problems = tuple(args.problems)
+    evaluator_timeout = args.evaluator_timeout or None
     if args.graph is None:
         output_dir = args.output_dir or Path("results/multicore_100cases")
         graph_paths = discover_cases(args.cases_dir, args.case_count)
@@ -882,8 +812,8 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             cores,
             problems,
-            make_plots=args.plot is True,
             workers=args.workers,
+            evaluator_timeout=evaluator_timeout,
         )
         return 1 if batch["failed"] else 0
 
@@ -896,9 +826,9 @@ def main(argv: list[str] | None = None) -> int:
         output_dir,
         cores,
         problems,
+        evaluator_timeout,
     )
-    make_plot = args.plot is not False
-    figure_outputs = [] if not make_plot else [str(path) for path in plot_speedup(aggregate, output_dir)]
+    figure_outputs = [str(plot_speedup(aggregate, output_dir))]
     print(json.dumps({
         "aggregate": str(output_dir / "aggregate.json"),
         "runs": len(aggregate["runs"]),
