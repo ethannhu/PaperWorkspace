@@ -27,9 +27,11 @@ import argparse
 import importlib
 import inspect
 import json
+import math
 import re
 import subprocess
 import sys
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -158,6 +160,229 @@ def _metric_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     return snapshot
 
 
+def _read_bandwidth(config_path: Path) -> int:
+    active_section: str | None = None
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        if text.startswith("[") and text.endswith("]"):
+            active_section = text[1:-1].strip().lower()
+            continue
+        if active_section == "bandwidth":
+            parts = text.split()
+            if len(parts) == 2 and parts[0] == "bandwidth":
+                return int(parts[1])
+    raise ValueError(f"{config_path}: missing [bandwidth] bandwidth setting")
+
+
+def _copy_transfer_bytes(
+    op: dict[str, Any],
+    in_tids: dict[int, list[int]],
+    out_tids: dict[int, list[int]],
+    tensor_by_id: dict[int, dict[str, Any]],
+) -> int:
+    if op.get("op") == "COPY_IN":
+        tids = out_tids.get(op["id"], [])
+    elif op.get("op") == "COPY_OUT":
+        tids = in_tids.get(op["id"], [])
+    else:
+        return 0
+    return sum(int(tensor_by_id[tid].get("size", 0)) for tid in tids if tid in tensor_by_id)
+
+
+def _graph_theoretical_metrics(
+    graph: dict[str, Any],
+    bandwidth: int,
+    cores: tuple[int, ...],
+) -> dict[str, Any]:
+    """Compute input-only lower bounds and graph difficulty features.
+
+    These values are intentionally independent of any algorithm output.  They
+    are lower bounds or risk indicators, not a replacement for simulator
+    makespan because the input graph contains no partition/core schedule.
+    """
+    ops = {int(item["id"]): item for item in graph.get("ops", [])}
+    tensor_by_id = {int(item["id"]): item for item in graph.get("tensors", [])}
+    in_edges: dict[int, list[int]] = defaultdict(list)
+    out_edges: dict[int, list[int]] = defaultdict(list)
+    for edge in graph.get("edges", []):
+        source = int(edge["source"])
+        target = int(edge["target"])
+        out_edges[source].append(target)
+        in_edges[target].append(source)
+
+    in_tids: dict[int, list[int]] = {}
+    out_tids: dict[int, list[int]] = {}
+    for op_id in ops:
+        in_tids[op_id] = [tid for tid in in_edges.get(op_id, []) if tid in tensor_by_id]
+        out_tids[op_id] = [tid for tid in out_edges.get(op_id, []) if tid in tensor_by_id]
+
+    succ: dict[int, set[int]] = defaultdict(set)
+    pred: dict[int, set[int]] = defaultdict(set)
+    produced_tensors = 0
+    consumed_tensors = 0
+    intermediate_tensor_bytes = 0
+    fanout_tensor_bytes = 0
+    for tensor_id, tensor in tensor_by_id.items():
+        producers = [node for node in in_edges.get(tensor_id, []) if node in ops]
+        consumers = [node for node in out_edges.get(tensor_id, []) if node in ops]
+        if producers:
+            produced_tensors += 1
+        if consumers:
+            consumed_tensors += 1
+        if producers and consumers:
+            size = int(tensor.get("size", 0))
+            intermediate_tensor_bytes += size
+            if len(consumers) > 1:
+                fanout_tensor_bytes += size * (len(consumers) - 1)
+        for source in producers:
+            for target in consumers:
+                if source != target:
+                    succ[source].add(target)
+                    pred[target].add(source)
+
+    op_durations: dict[int, int] = {}
+    copy_bytes_by_type = {"COPY_IN": 0, "COPY_OUT": 0}
+    for op_id, op in ops.items():
+        transfer_bytes = _copy_transfer_bytes(op, in_tids, out_tids, tensor_by_id)
+        if op.get("op") in copy_bytes_by_type:
+            copy_bytes_by_type[op["op"]] += transfer_bytes
+            op_durations[op_id] = max(1, math.ceil(transfer_bytes / bandwidth)) if transfer_bytes else 0
+        else:
+            op_durations[op_id] = int(op.get("cycles", 0))
+
+    indegree = {op_id: len(pred[op_id]) for op_id in ops}
+    ready = deque(op_id for op_id, degree in indegree.items() if degree == 0)
+    depth = {op_id: 0 for op_id in ready}
+    longest_finish = {op_id: op_durations.get(op_id, 0) for op_id in ready}
+    topo_count = 0
+    while ready:
+        op_id = ready.popleft()
+        topo_count += 1
+        finish = longest_finish.get(op_id, op_durations.get(op_id, 0))
+        for nxt in succ[op_id]:
+            depth[nxt] = max(depth.get(nxt, 0), depth.get(op_id, 0) + 1)
+            longest_finish[nxt] = max(
+                longest_finish.get(nxt, 0),
+                finish + op_durations.get(nxt, 0),
+            )
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                ready.append(nxt)
+    if topo_count != len(ops):
+        raise ValueError("input graph has a cycle in the folded op-DAG")
+
+    layer_width = Counter(depth.values())
+    op_counts = Counter(str(op.get("op")) for op in ops.values())
+    pipe_work = Counter()
+    for op_id, op in ops.items():
+        pipe_work[str(op.get("pipe"))] += op_durations.get(op_id, 0)
+    max_pipe_work = max(pipe_work.values(), default=0)
+    total_duration = sum(op_durations.values())
+    non_copy_cycles = sum(
+        int(op.get("cycles", 0))
+        for op in ops.values()
+        if op.get("op") not in {"COPY_IN", "COPY_OUT"}
+    )
+    original_copy_bytes = copy_bytes_by_type["COPY_IN"] + copy_bytes_by_type["COPY_OUT"]
+    ddr_time_lower_bound = original_copy_bytes / bandwidth if bandwidth else 0.0
+    critical_path = max(longest_finish.values(), default=0)
+    critical_path_non_copy = 0
+    # The weighted critical path above includes estimated COPY durations.  This
+    # companion value is useful when comparing purely computational structure.
+    non_copy_duration = {
+        op_id: (0 if ops[op_id].get("op") in {"COPY_IN", "COPY_OUT"} else int(ops[op_id].get("cycles", 0)))
+        for op_id in ops
+    }
+    finish_non_copy: dict[int, int] = {}
+    for op_id in sorted(ops, key=lambda item: depth.get(item, 0)):
+        finish_non_copy[op_id] = max(
+            [finish_non_copy[p] for p in pred[op_id]] or [0]
+        ) + non_copy_duration[op_id]
+    critical_path_non_copy = max(finish_non_copy.values(), default=0)
+
+    lower_bounds: dict[str, dict[str, float]] = {}
+    single_core_lower_bound = None
+    for num_cores in sorted(set(cores)):
+        work_bound = total_duration / num_cores if num_cores else 0.0
+        pipe_bound = max_pipe_work / num_cores if num_cores else 0.0
+        lower_bound = max(
+            float(critical_path),
+            work_bound,
+            pipe_bound,
+            ddr_time_lower_bound,
+        )
+        if num_cores == 1:
+            single_core_lower_bound = lower_bound
+        lower_bounds[str(num_cores)] = {
+            "lower_bound_cycles": lower_bound,
+            "work_bound_cycles": work_bound,
+            "pipe_bound_cycles": pipe_bound,
+            "critical_path_cycles": float(critical_path),
+            "ddr_time_lower_bound_cycles": ddr_time_lower_bound,
+        }
+    if single_core_lower_bound is None:
+        single_core_lower_bound = next(iter(lower_bounds.values()))["lower_bound_cycles"] if lower_bounds else 0.0
+    for item in lower_bounds.values():
+        bound = item["lower_bound_cycles"]
+        item["input_speedup_upper_bound"] = (
+            single_core_lower_bound / bound if bound else None
+        )
+
+    tensor_bytes_by_pos = Counter(str(tensor.get("pos")) for tensor in tensor_by_id.values())
+    tensor_size_by_pos = Counter()
+    for tensor in tensor_by_id.values():
+        tensor_size_by_pos[str(tensor.get("pos"))] += int(tensor.get("size", 0))
+
+    branch_nodes = sum(1 for op_id in ops if len(succ[op_id]) > 1)
+    merge_nodes = sum(1 for op_id in ops if len(pred[op_id]) > 1)
+    op_count = len(ops)
+    return {
+        "graph_size": {
+            "op_count": op_count,
+            "tensor_count": len(tensor_by_id),
+            "edge_count": len(graph.get("edges", [])),
+            "produced_tensor_count": produced_tensors,
+            "consumed_tensor_count": consumed_tensors,
+        },
+        "op_counts": dict(sorted(op_counts.items())),
+        "tensor_count_by_pos": dict(sorted(tensor_bytes_by_pos.items())),
+        "tensor_bytes_by_pos": dict(sorted(tensor_size_by_pos.items())),
+        "work": {
+            "total_estimated_cycles": total_duration,
+            "non_copy_compute_cycles": non_copy_cycles,
+            "pipe_work_cycles": dict(sorted(pipe_work.items())),
+            "max_pipe_work_cycles": max_pipe_work,
+        },
+        "copy": {
+            "original_copy_bytes": original_copy_bytes,
+            "copy_in_bytes": copy_bytes_by_type["COPY_IN"],
+            "copy_out_bytes": copy_bytes_by_type["COPY_OUT"],
+            "ddr_time_lower_bound_cycles": ddr_time_lower_bound,
+        },
+        "topology": {
+            "critical_path_cycles": critical_path,
+            "critical_path_non_copy_cycles": critical_path_non_copy,
+            "dag_depth": max(depth.values(), default=0),
+            "max_layer_width": max(layer_width.values(), default=0),
+            "average_parallelism": total_duration / critical_path if critical_path else None,
+            "branch_nodes": branch_nodes,
+            "merge_nodes": merge_nodes,
+            "branch_fraction": branch_nodes / op_count if op_count else 0.0,
+            "merge_fraction": merge_nodes / op_count if op_count else 0.0,
+        },
+        "communication_risk": {
+            "intermediate_tensor_bytes": intermediate_tensor_bytes,
+            "fanout_tensor_extra_bytes": fanout_tensor_bytes,
+            "fanout_to_original_copy_ratio": (
+                fanout_tensor_bytes / original_copy_bytes if original_copy_bytes else None
+            ),
+        },
+        "lower_bounds_by_core": lower_bounds,
+    }
+
+
 def evaluate(
     graph_path: Path,
     algorithm_spec: str,
@@ -174,6 +399,8 @@ def evaluate(
     simulator_output_dir = output_dir / "output"
     simulator_output_dir.mkdir(parents=True, exist_ok=True)
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    bandwidth = _read_bandwidth(config_path)
+    theoretical_metrics = _graph_theoretical_metrics(graph, bandwidth, cores)
     algorithm = _load_callable(algorithm_spec)
     reusable_context = _prepare_reusable_context(algorithm, graph)
     repo_root = Path(__file__).resolve().parents[1]
@@ -241,6 +468,7 @@ def evaluate(
         "core_counts": list(cores),
         "baseline_core_count": 1,
         "baseline_makespan": baseline,
+        "theoretical_metrics": theoretical_metrics,
         "runs": runs,
     }
     aggregate_path = output_dir / "aggregate.json"
@@ -380,7 +608,7 @@ def evaluate_cases(
 
 
 def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
-    """Draw the Q1--Q3 speedup trend and export editable/vector formats."""
+    """Draw speedup trends together with input-derived theoretical bounds."""
     import matplotlib as mpl
 
     mpl.rcParams.update({
@@ -401,18 +629,30 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
     core_counts = [item["num_cores"] for item in runs]
     colors = {"q1": "#0F4D92", "q2": "#42949E", "q3": "#B64342"}
     labels = {"q1": "Q1", "q2": "Q2", "q3": "Q3"}
+    theoretical = aggregate.get("theoretical_metrics") or {}
+    lower_bounds = theoretical.get("lower_bounds_by_core") or {}
+    has_theoretical = bool(lower_bounds)
 
-    fig, ax = plt.subplots(figsize=(3.5, 2.7), constrained_layout=False)
+    if has_theoretical:
+        fig, (ax, gap_ax) = plt.subplots(
+            2,
+            1,
+            figsize=(3.5, 4.1),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.45, 1.0]},
+            constrained_layout=False,
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(3.5, 2.7), constrained_layout=False)
+        gap_ax = None
     for problem in ("q1", "q2", "q3"):
-        values = [
-            item["problems"][problem]["metrics"]["speedup"]
-            for item in runs
-            if problem in item["problems"]
-        ]
+        problem_runs = [item for item in runs if problem in item["problems"]]
+        problem_cores = [item["num_cores"] for item in problem_runs]
+        values = [item["problems"][problem]["metrics"]["speedup"] for item in problem_runs]
         if not values:
             continue
         ax.plot(
-            core_counts[: len(values)],
+            problem_cores,
             values,
             marker="o",
             markersize=4,
@@ -420,15 +660,61 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
             color=colors[problem],
             label=labels[problem],
         )
+        if has_theoretical:
+            baseline = aggregate.get("baseline_makespan", {}).get(problem)
+            upper_values = []
+            gap_values = []
+            gap_cores = []
+            for item in problem_runs:
+                core_key = str(item["num_cores"])
+                bound = lower_bounds.get(core_key, {}).get("lower_bound_cycles")
+                makespan = item["problems"][problem]["metrics"].get("makespan")
+                if not bound:
+                    upper_values.append(None)
+                    continue
+                upper_values.append(baseline / bound if baseline else None)
+                if makespan:
+                    gap_cores.append(item["num_cores"])
+                    gap_values.append(makespan / bound)
+            if any(value is not None for value in upper_values):
+                ax.plot(
+                    problem_cores,
+                    upper_values,
+                    linewidth=1.1,
+                    color=colors[problem],
+                    alpha=0.45,
+                    linestyle="--",
+                    label=f"{labels[problem]} input bound",
+                )
+            if gap_ax is not None and gap_values:
+                gap_ax.plot(
+                    gap_cores,
+                    gap_values,
+                    marker="s",
+                    markersize=3.2,
+                    linewidth=1.25,
+                    color=colors[problem],
+                    label=labels[problem],
+                )
     ax.axhline(1.0, color="#767676", linewidth=0.8, linestyle="--", zorder=0)
-    ax.set_xlabel("Number of cores")
+    if gap_ax is None:
+        ax.set_xlabel("Number of cores")
     ax.set_ylabel("Speedup over 1 core")
     ax.set_xticks(core_counts)
     ax.set_xlim(min(core_counts) - 0.12, max(core_counts) + 0.12)
     ax.set_ylim(bottom=0)
     ax.grid(axis="y", color="#D9D9D9", linewidth=0.55, alpha=0.8)
     ax.set_axisbelow(True)
-    ax.legend(loc="upper left", ncol=3, handlelength=1.8, columnspacing=1.0)
+    ax.legend(loc="upper left", ncol=2 if has_theoretical else 3, handlelength=1.8, columnspacing=1.0)
+    if gap_ax is not None:
+        gap_ax.axhline(1.0, color="#767676", linewidth=0.8, linestyle="--", zorder=0)
+        gap_ax.set_xlabel("Number of cores")
+        gap_ax.set_ylabel("Makespan / input lower bound")
+        gap_ax.set_xticks(core_counts)
+        gap_ax.set_xlim(min(core_counts) - 0.12, max(core_counts) + 0.12)
+        gap_ax.set_ylim(bottom=0)
+        gap_ax.grid(axis="y", color="#D9D9D9", linewidth=0.55, alpha=0.8)
+        gap_ax.set_axisbelow(True)
     fig.tight_layout(pad=0.8)
 
     skill_scripts = Path(__file__).resolve().parents[1] / ".agents" / "skills" / "nature-figure" / "scripts"
@@ -466,6 +752,43 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> list[Path]:
             for problem in ("q1", "q2", "q3")
         },
     }
+    if has_theoretical:
+        speedup_data["theoretical"] = {
+            "lower_bound_cycles": [
+                lower_bounds.get(str(num_cores), {}).get("lower_bound_cycles")
+                for num_cores in core_counts
+            ],
+            "input_speedup_upper_bound": [
+                lower_bounds.get(str(num_cores), {}).get("input_speedup_upper_bound")
+                for num_cores in core_counts
+            ],
+            "problem_speedup_upper_bound": {
+                problem: [
+                    (
+                        aggregate.get("baseline_makespan", {}).get(problem)
+                        / lower_bounds.get(str(num_cores), {}).get("lower_bound_cycles")
+                        if lower_bounds.get(str(num_cores), {}).get("lower_bound_cycles")
+                        else None
+                    )
+                    for num_cores in core_counts
+                ]
+                for problem in ("q1", "q2", "q3")
+                if problem in aggregate.get("baseline_makespan", {})
+            },
+            "makespan_to_lower_bound": {
+                problem: [
+                    (
+                        item["problems"][problem]["metrics"].get("makespan")
+                        / lower_bounds.get(str(item["num_cores"]), {}).get("lower_bound_cycles")
+                        if lower_bounds.get(str(item["num_cores"]), {}).get("lower_bound_cycles")
+                        else None
+                    )
+                    for item in runs
+                    if problem in item["problems"]
+                ]
+                for problem in ("q1", "q2", "q3")
+            },
+        }
     data_path = output_dir / "speedup_data.json"
     data_path.write_text(
         json.dumps(speedup_data, ensure_ascii=False, indent=2) + "\n",

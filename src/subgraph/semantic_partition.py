@@ -391,14 +391,20 @@ def _singleton_repair_score(
     )
 
 
-def _repair_singleton_blocks(
+def repair_singleton_blocks(
     features: GraphFeatures,
     blocks: dict[int, SemanticBlock],
     node_features: dict[int, NodeFeature],
     max_ops: int,
     max_cycles: int,
 ) -> None:
-    """Merge profitable singleton blocks left by the strict semantic pass."""
+    """Merge profitable singleton blocks left by the strict semantic pass.
+
+    This repair pass is intentionally separate from ``semantic_partition``'s
+    default path.  It is useful as an experiment when isolated one-op blocks
+    are too conservative, but it may also reduce parallelism around fan-in or
+    fan-out structures.
+    """
     for _ in range(2):
         owner = _owner_map(blocks)
         changed = False
@@ -567,19 +573,37 @@ def semantic_partition(
     features: GraphFeatures,
     max_ops: int = 16,
     max_cycles: int = 20000,
+    enable_singleton_repair: bool = False,
 ) -> list[Partition]:
     """Partition an analyzed graph using semantic motifs and merge scores."""
     if max_ops < 1 or max_cycles < 1:
         raise ValueError("partition limits must be positive")
     blocks, node_features = _build_stage_blocks(features)
     _merge_blocks(features, blocks, node_features, max_ops, max_cycles)
-    _repair_singleton_blocks(features, blocks, node_features, max_ops, max_cycles)
+    if enable_singleton_repair:
+        repair_singleton_blocks(features, blocks, node_features, max_ops, max_cycles)
     return build_partition_dag(features, blocks)
+
+
+def semantic_partition_with_singleton_repair(
+    features: GraphFeatures,
+    max_ops: int = 16,
+    max_cycles: int = 20000,
+) -> list[Partition]:
+    """Partition with the optional singleton repair pass enabled."""
+    return semantic_partition(
+        features,
+        max_ops=max_ops,
+        max_cycles=max_cycles,
+        enable_singleton_repair=True,
+    )
 
 
 __all__ = [
     "NodeFeature",
     "SemanticBlock",
     "extract_features",
+    "repair_singleton_blocks",
     "semantic_partition",
+    "semantic_partition_with_singleton_repair",
 ]
