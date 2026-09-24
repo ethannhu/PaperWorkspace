@@ -29,6 +29,12 @@ ELEMENTWISE_ROLES = {"ELEMENTWISE"}
 COMMUNICATION_ROLES = {"COMMUNICATION"}
 MEMORY_ROLES = {"MEMORY"}
 
+# These are the fixed evaluator settings in ``artifacts/data/config.txt``.
+# The merge score is deliberately expressed in a small, dimensionless range,
+# but its input is still the evaluator's transfer time rather than raw bytes.
+_EVALUATOR_BANDWIDTH_BYTES_PER_CYCLE = 60
+_COMMUNICATION_REFERENCE_CYCLES = 16
+
 
 @dataclass(frozen=True)
 class NodeFeature:
@@ -195,9 +201,12 @@ def _merge_score(
         return float("-inf")
     if tail.pipe != head.pipe and not _explicit_stage_pair(tail, head):
         return float("-inf")
-    # The byte term is normalized so a large tensor strongly favors avoiding a
-    # writeback, while tiny edges still need semantic affinity to merge.
-    communication_saved = min(6.0, edge_bytes / 1024.0)
+    # Price the avoided partition boundary by its DMA time.  Raw byte scores
+    # made the result depend on an arbitrary KiB unit and saturated every
+    # tensor above 6 KiB at the same reward.  The logarithm keeps this term on
+    # the scale of the semantic terms while preserving the 4 KiB -> 32 KiB
+    # distinction present in the evaluator (69 -> 547 transfer cycles).
+    communication_saved = _communication_saved(edge_bytes)
     locality_gain = 1.5 if left.output_tensors & right.input_tensors else 0.0
     resource_diversity = 0.8 if tail.pipe != head.pipe else -0.4
     parallelism_loss = 2.5 * (tail.outdegree > 1 or head.indegree > 1)
@@ -251,9 +260,44 @@ def _crossing_bytes(
     right: SemanticBlock,
     edge_pairs: list[tuple[int, int]] | None = None,
 ) -> int:
+    """Return tensor bytes materialized at a block boundary exactly once.
+
+    A tensor may feed several operations in ``right``.  Summing operation
+    edges counts that one DMA repeatedly, while the evaluator transfers it
+    once per destination task.  COPY contraction can hide tensor identity;
+    retain the contracted-edge estimate as a fallback for that case.
+    """
+    produced = set().union(
+        *(features.output_tensors.get(node, set()) for node in left.nodes)
+    )
+    consumed = set().union(
+        *(features.input_tensors.get(node, set()) for node in right.nodes)
+    )
+    shared_tensors = produced & consumed
+    if shared_tensors:
+        return sum(
+            int(features.tensor_by_id[tensor_id].get("size", 0))
+            for tensor_id in shared_tensors
+        )
     if edge_pairs is None:
         edge_pairs = _edges_between(features, left, right)
     return sum(features.edge_sizes.get(edge, 0) for edge in edge_pairs)
+
+
+def _communication_saved(edge_bytes: int) -> float:
+    """Normalize avoided transfer time for use in a merge score.
+
+    ``ceil(bytes / 60)`` is the payload portion of the official evaluator's
+    transfer model.  Fixed wait time is excluded: whether it applies depends
+    on the later core placement and Q1/Q2 scenario, neither of which is known
+    during scenario-independent semantic partitioning.  Sixteen cycles is a
+    score-scale reference, not a hardware parameter; it keeps this reward
+    comparable with the 1--4 point semantic affinity terms.
+    """
+    if edge_bytes <= 0:
+        return 0.0
+    transfer_cycles = math.ceil(edge_bytes / _EVALUATOR_BANDWIDTH_BYTES_PER_CYCLE)
+    return math.log1p(transfer_cycles / _COMMUNICATION_REFERENCE_CYCLES)
 
 
 def _would_create_partition_cycle(
@@ -320,7 +364,7 @@ def _singleton_repair_score(
         return float("-inf")
 
     edge_bytes = _crossing_bytes(graph_features, left, right, edge_pairs)
-    communication_saved = 2.0 * math.log1p(edge_bytes / 1024.0)
+    communication_saved = _communication_saved(edge_bytes)
     locality_gain = 1.5 if left.output_tensors & right.input_tensors else 0.0
     semantic_gain = max(
         _semantic_affinity(node_features[src], node_features[dst])
