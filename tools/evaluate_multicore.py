@@ -32,7 +32,7 @@ from tqdm import tqdm
 from subgraph.interfaces import AlgorithmResult
 
 
-PROBLEMS = (1, 2, 3)
+QUESTIONS = ("q1", "q2", "q3")
 CORE_COUNTS = (1, 2, 3, 4, 5)
 WORKERS = 4
 EVALUATOR_TIMEOUT_SECONDS = 600
@@ -382,7 +382,7 @@ def evaluate(
     config_path: Path,
     output_dir: Path,
     cores: tuple[int, ...] = CORE_COUNTS,
-    problems: tuple[int, ...] = PROBLEMS,
+    questions: tuple[str, ...] = QUESTIONS,
     evaluator_timeout: int | None = EVALUATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     graph_path = graph_path.resolve()
@@ -395,13 +395,13 @@ def evaluate(
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     bandwidth = _read_bandwidth(config_path)
     theoretical_metrics = _graph_theoretical_metrics(graph, bandwidth, cores)
-    algorithms = {
-        scenario: _load_callable(spec)
-        for scenario, spec in algorithm_specs.items()
+    selected_algorithms = {
+        question: _load_callable(algorithm_specs[question])
+        for question in questions
     }
     reusable_contexts = {
-        scenario: _prepare_reusable_context(algorithm, graph)
-        for scenario, algorithm in algorithms.items()
+        question: _prepare_reusable_context(algorithm, graph)
+        for question, algorithm in selected_algorithms.items()
     }
     repo_root = Path(__file__).resolve().parents[1]
     evaluator_dir = repo_root / "artifacts" / "code"
@@ -410,36 +410,35 @@ def evaluate(
     diagnostics_runs: dict[str, dict[str, Any]] = {}
     for num_cores in cores:
         plans: dict[str, str] = {}
-        for problem in problems:
-            scenario = f"q{problem}"
+        for question in questions:
             result = _call_algorithm(
-                algorithms[scenario],
+                selected_algorithms[question],
                 graph,
                 num_cores,
-                scenario,
-                reusable_contexts[scenario],
+                question,
+                reusable_contexts[question],
             )
-            plan_path = input_dir / f"plan_{scenario}_{num_cores}cores.json"
+            plan_path = input_dir / f"plan_{question}_{num_cores}cores.json"
             plan_path.write_text(json.dumps(result.plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            plans[scenario] = str(plan_path)
-            diagnostics_runs.setdefault(scenario, {})[str(num_cores)] = result.diagnostics
+            plans[question] = str(plan_path)
+            diagnostics_runs.setdefault(question, {})[str(num_cores)] = result.diagnostics
 
         run: dict[str, Any] = {"num_cores": num_cores, "plans": plans, "problems": {}}
-        for problem in problems:
-            scenario = f"q{problem}"
+        for question in questions:
+            problem = int(question[1:])
             evaluator = evaluator_dir / f"multicore_cut_evaluate_problem_{problem}.py"
             # Keep official evaluator artifacts in output/ and algorithm plans
             # in input/ so the case directory has a stable input/output split.
-            result_path = simulator_output_dir / f"result_{scenario}_{num_cores}cores.json"
+            result_path = simulator_output_dir / f"result_{question}_{num_cores}cores.json"
             result, stdout = _run_evaluator(
                 evaluator,
                 graph_path,
-                Path(plans[scenario]),
+                Path(plans[question]),
                 config_path,
                 result_path,
                 evaluator_timeout,
             )
-            run["problems"][scenario] = {
+            run["problems"][question] = {
                 "result_path": str(result_path),
                 "metrics": _metric_snapshot(result),
                 "stdout": stdout,
@@ -447,16 +446,16 @@ def evaluate(
         runs.append(run)
 
     baseline = {
-        f"q{problem}": next(
-            item["problems"][f"q{problem}"]["metrics"]["makespan"]
+        question: next(
+            item["problems"][question]["metrics"]["makespan"]
             for item in runs
             if item["num_cores"] == 1
         )
-        for problem in problems
+        for question in questions
     }
     for run in runs:
-        for problem in problems:
-            key = f"q{problem}"
+        for question in questions:
+            key = question
             makespan = run["problems"][key]["metrics"]["makespan"]
             run["problems"][key]["metrics"]["speedup"] = (
                 baseline[key] / makespan if makespan else None
@@ -465,6 +464,7 @@ def evaluate(
     aggregate = {
         "graph": str(graph_path),
         "algorithm": algorithm_specs,
+        "questions": list(questions),
         "config": str(config_path),
         "core_counts": list(cores),
         "baseline_core_count": 1,
@@ -518,7 +518,7 @@ def evaluate_cases(
     algorithm_specs: dict[str, str],
     output_dir: Path,
     cores: tuple[int, ...] = CORE_COUNTS,
-    problems: tuple[int, ...] = PROBLEMS,
+    questions: tuple[str, ...] = QUESTIONS,
     workers: int = WORKERS,
     evaluator_timeout: int | None = EVALUATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
@@ -541,7 +541,7 @@ def evaluate_cases(
             case_config,
             case_output_dir,
             cores,
-            problems,
+            questions,
             evaluator_timeout,
         )
         futures[future] = (index, graph_path, case_output_dir)
@@ -594,7 +594,7 @@ def evaluate_cases(
         "failed": len(cases) - successful,
         "workers": workers,
         "core_counts": list(cores),
-        "problems": list(problems),
+        "questions": list(questions),
         "cases": cases,
     }
 
@@ -740,18 +740,18 @@ def main(argv: list[str] | None = None) -> int:
         help="核数；默认包含 1-5 核，其中 1 核作为加速比基线",
     )
     parser.add_argument(
-        "--problems",
+        "--q",
         nargs="+",
-        type=int,
-        choices=PROBLEMS,
-        default=list(PROBLEMS),
+        choices=QUESTIONS,
+        default=list(QUESTIONS),
+        help="要评测的问题；可单选或多选，例如 --q q1 q3",
     )
     args = parser.parse_args(argv)
     if 1 not in args.cores:
         args.cores = [1, *args.cores]
 
     cores = tuple(sorted(set(args.cores)))
-    problems = tuple(args.problems)
+    questions = tuple(args.q)
     output_dir = args.output_dir or Path("results/multicore_cases")
     graph_paths = discover_cases(args.cases_dir)
     batch = evaluate_cases(
@@ -759,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         DEFAULT_ALGORITHMS,
         output_dir,
         cores,
-        problems,
+        questions,
         WORKERS,
         EVALUATOR_TIMEOUT_SECONDS,
     )
