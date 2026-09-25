@@ -7,22 +7,21 @@ The implementation is intentionally plain:
 * Kahn topological sort for graph analysis;
 * critical-path-first list scheduling on identical cores.
 
-Partitioners, schedulers, and optional schedule optimizers are injected as
-ordinary callables.  The default pipeline uses the semantic partitioner and
-the built-in list scheduler.
+Graph-pattern strategies own both partitioning and scheduling.  The current
+strategies all share the semantic partitioner plus the same list scheduler,
+but the framework treats each pattern branch as one complete algorithm.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-from .interfaces import AlgorithmResult, Partitioner, ScheduleOptimizer, Scheduler
+from .interfaces import AlgorithmResult
 
 
 COPY_TYPES = {"COPY_IN", "COPY_OUT"}
@@ -58,38 +57,6 @@ class Partition:
     pipe_cycles: dict[str, int] = field(default_factory=dict)
     preds: set[int] = field(default_factory=set)
     succs: set[int] = field(default_factory=set)
-
-
-@dataclass(frozen=True)
-class PlanContext:
-    """Graph analysis and partitioning that can be reused across schedules."""
-
-    features: GraphFeatures
-    partitions: tuple[Partition, ...]
-
-
-@dataclass(frozen=True)
-class CandidateDiagnostics:
-    """Static diagnostics for one hypothetical partition placement."""
-
-    partition_id: int | None
-    candidate_core: int | None
-    cross_core_edge_bytes: int
-    critical_cross_core_edges: tuple[dict[str, Any], ...]
-    per_core_compute_load: dict[int, int]
-    per_core_partition_count: dict[int, int]
-    objective_end: float | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "partition_id": self.partition_id,
-            "candidate_core": self.candidate_core,
-            "cross_core_edge_bytes": self.cross_core_edge_bytes,
-            "critical_cross_core_edges": [dict(edge) for edge in self.critical_cross_core_edges],
-            "per_core_compute_load": dict(self.per_core_compute_load),
-            "per_core_partition_count": dict(self.per_core_partition_count),
-            "objective_end": self.objective_end,
-        }
 
 
 def classify_op(op_type: str) -> str:
@@ -246,51 +213,27 @@ def _edge_size(features: GraphFeatures, source: int, target: int) -> int:
     return features.edge_sizes.get((source, target), 0)
 
 
-def build_partitions(
+def describe_graph_pattern(features: GraphFeatures) -> dict[str, Any]:
+    """Return the graph-pattern diagnostics emitted with each plan."""
+    from .graph_patterns import classify_features
+
+    return classify_features(features).as_dict()
+
+
+def _semantic_plan(
     features: GraphFeatures,
-    max_ops: int = 16,
-    max_cycles: int = 20000,
-    partitioner: Partitioner | None = None,
-) -> list[Partition]:
-    """Run the supplied partitioner, defaulting to the semantic partitioner."""
-    if partitioner is None:
-        from .semantic_partition import semantic_partition
+    num_cores: int,
+    scenario: str,
+) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
+    """Current complete strategy: semantic blocks followed by list scheduling."""
+    from .semantic_partition import semantic_partition
 
-        partitioner = semantic_partition
-    return partitioner(features, max_ops, max_cycles)
-
-
-def _clone_partitions(partitions: Iterable[Partition]) -> list[Partition]:
-    """Return independent partition objects for one scheduler run."""
-    return [
-        Partition(
-            id=partition.id,
-            ops=list(partition.ops),
-            cycles=partition.cycles,
-            rank_u=partition.rank_u,
-            pipe_cycles=dict(partition.pipe_cycles),
-            preds=set(partition.preds),
-            succs=set(partition.succs),
-        )
-        for partition in partitions
-    ]
-
-
-def prepare_plan_context(
-    graph: dict[str, Any],
-    partitioner: Partitioner | None = None,
-    max_ops: int = 16,
-    max_cycles: int = 20000,
-) -> PlanContext:
-    """Analyze and partition a graph once for repeated scheduling calls."""
-    features = analyze_graph(graph)
-    partitions = build_partitions(
-        features,
-        max_ops=max_ops,
-        max_cycles=max_cycles,
-        partitioner=partitioner,
-    )
-    return PlanContext(features=features, partitions=tuple(partitions))
+    partitions = semantic_partition(features)
+    core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+    return partitions, core_orders, {
+        "strategy": "semantic",
+        "partition_count": len(partitions),
+    }
 
 
 def _partition_topology(partitions: list[Partition]) -> list[int]:
@@ -299,68 +242,12 @@ def _partition_topology(partitions: list[Partition]) -> list[int]:
     return _topological_order([p.id for p in partitions], preds, succs)
 
 
-def _candidate_diagnostics(
-    partitions: list[Partition],
-    features: GraphFeatures,
-    core_of: dict[int, int],
-    num_cores: int,
-    partition_id: int | None = None,
-    candidate_core: int | None = None,
-    objective_end: float | None = None,
-) -> CandidateDiagnostics:
-    """Measure communication and load for a complete or partial placement."""
-    cross_core_edges: list[dict[str, Any]] = []
-    cross_core_edge_bytes = 0
-    for source in partitions:
-        if source.id not in core_of:
-            continue
-        for target_id in sorted(source.succs):
-            if target_id not in core_of or core_of[target_id] == core_of[source.id]:
-                continue
-            target = partitions[target_id]
-            edge_bytes = _partition_transfer_bytes(features, source, target)
-            criticality = max(source.rank_u, target.rank_u)
-            cross_core_edge_bytes += edge_bytes
-            cross_core_edges.append({
-                "source_partition": source.id,
-                "target_partition": target.id,
-                "source_core": core_of[source.id],
-                "target_core": core_of[target.id],
-                "bytes": edge_bytes,
-                "criticality": criticality,
-            })
-    cross_core_edges.sort(
-        key=lambda edge: (-edge["bytes"], -edge["criticality"],
-                          edge["source_partition"], edge["target_partition"])
-    )
-    compute_load = {core: 0 for core in range(num_cores)}
-    partition_count = {core: 0 for core in range(num_cores)}
-    by_id = {partition.id: partition for partition in partitions}
-    for pid, core in core_of.items():
-        compute_load[core] += by_id[pid].cycles
-        partition_count[core] += 1
-    return CandidateDiagnostics(
-        partition_id=partition_id,
-        candidate_core=candidate_core,
-        cross_core_edge_bytes=cross_core_edge_bytes,
-        # Keep the report compact while retaining the heaviest and most
-        # critical communication boundaries for each candidate.
-        critical_cross_core_edges=tuple(cross_core_edges[:10]),
-        per_core_compute_load=compute_load,
-        per_core_partition_count=partition_count,
-        objective_end=objective_end,
-    )
-
-
-def schedule_partitions(
+def _schedule_partitions(
     partitions: list[Partition],
     features: GraphFeatures,
     num_cores: int,
     scenario: str = "q2",
-    return_diagnostics: bool = False,
-) -> tuple[dict[int, int], list[list[int]]] | tuple[
-    dict[int, int], list[list[int]], dict[str, Any]
-]:
+) -> list[list[int]]:
     """Critical-path-first list schedule for identical cores."""
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
@@ -383,7 +270,6 @@ def schedule_partitions(
     cross_core_wait = 1000
     core_pipe_load: list[dict[str, int]] = [dict() for _ in range(num_cores)]
     estimated_ddr_bytes = 0
-    candidate_diagnostics: list[dict[str, Any]] = []
 
     while ready:
         ready.sort(key=lambda pid: (-by_id[pid].rank_u, topo_position[pid]))
@@ -422,20 +308,6 @@ def schedule_partitions(
             # The lower bound cannot be hidden below the compute estimate.
             objective_end = max(float(end), ddr_lb)
             choice = (objective_end, pipe_imbalance, max_pipe_load, end, core)
-            if return_diagnostics:
-                candidate_core_of = dict(core_of)
-                candidate_core_of[pid] = core
-                candidate_diagnostics.append(
-                    _candidate_diagnostics(
-                        partitions,
-                        features,
-                        candidate_core_of,
-                        num_cores,
-                        partition_id=pid,
-                        candidate_core=core,
-                        objective_end=objective_end,
-                    ).as_dict()
-                )
             if best is None or choice < best:
                 best = choice
         assert best is not None
@@ -457,18 +329,7 @@ def schedule_partitions(
             remaining[successor] -= 1
             if remaining[successor] == 0:
                 ready.append(successor)
-    if not return_diagnostics:
-        return core_of, core_orders
-    selected = _candidate_diagnostics(
-        partitions,
-        features,
-        core_of,
-        num_cores,
-    ).as_dict()
-    return core_of, core_orders, {
-        "candidates": candidate_diagnostics,
-        "selected": selected,
-    }
+    return core_orders
 
 
 def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, source: int, target: int) -> int:
@@ -480,287 +341,34 @@ def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, s
     )
 
 
-def _partition_transfer_bytes(
-    features: GraphFeatures,
-    source: Partition,
-    target: Partition,
-) -> int:
-    """Sum each tensor crossing a partition pair once.
-
-    A tensor can feed several operations in the destination partition.  The
-    evaluator transfers that tensor once per remote task, so counting every
-    operation pair would overstate the communication volume.
-    """
-    produced = set().union(
-        *(features.output_tensors.get(op_id, set()) for op_id in source.ops)
-    )
-    consumed = set().union(
-        *(features.input_tensors.get(op_id, set()) for op_id in target.ops)
-    )
-    return sum(
-        int(features.tensor_by_id[tensor_id].get("size", 0))
-        for tensor_id in produced & consumed
-    )
-
-
-def _core_orders_are_valid(
-    partitions: list[Partition], core_orders: list[list[int]]
-) -> tuple[list[int], dict[tuple[int, int], bool]] | None:
-    """Return a topological order after adding per-core order constraints.
-
-    The evaluator requires both the partition DAG and each core schedule to be
-    acyclic.  A move that is locally harmless can still create a cycle through
-    a cross-core dependency, so every local-search candidate goes through this
-    small exact check.
-    """
-    by_id = {partition.id: partition for partition in partitions}
-    all_ids = set(by_id)
-    if set(pid for order in core_orders for pid in order) != all_ids:
-        return None
-    if any(len(order) != len(set(order)) for order in core_orders):
-        return None
-
-    succs = {pid: set(by_id[pid].succs) for pid in all_ids}
-    preds = {pid: set(by_id[pid].preds) for pid in all_ids}
-    original_edges: dict[tuple[int, int], bool] = {}
-    for source in all_ids:
-        for target in by_id[source].succs:
-            original_edges[(source, target)] = True
-
-    # Consecutive tasks on one core are ordered, but do not carry tensor data.
-    for order in core_orders:
-        for source, target in zip(order, order[1:]):
-            if target not in succs[source]:
-                succs[source].add(target)
-                preds[target].add(source)
-            original_edges.setdefault((source, target), False)
-
-    ready = sorted(pid for pid in all_ids if not preds[pid])
-    topo: list[int] = []
-    while ready:
-        pid = ready.pop(0)
-        topo.append(pid)
-        for target in sorted(succs[pid]):
-            preds[target].remove(pid)
-            if not preds[target]:
-                ready.append(target)
-                ready.sort()
-    if len(topo) != len(all_ids):
-        return None
-    return topo, original_edges
-
-
-def _proxy_schedule_objective(
-    partitions: list[Partition],
-    features: GraphFeatures,
-    core_orders: list[list[int]],
-    num_cores: int,
-    scenario: str,
-    transfer_bytes: dict[tuple[int, int], int] | None = None,
-) -> tuple[float, int, int] | None:
-    """Score one complete placement using the evaluator's fixed delays.
-
-    This is intentionally a cheap filter, not a replacement for the official
-    evaluator.  The tuple prioritizes proxy makespan, then communication, then
-    compute imbalance.
-    """
-    checked = _core_orders_are_valid(partitions, core_orders)
-    if checked is None:
-        return None
-    topo, edge_kinds = checked
-    core_of = {
-        pid: core
-        for core, order in enumerate(core_orders)
-        for pid in order
-    }
-    by_id = {partition.id: partition for partition in partitions}
-    transfer_bytes = transfer_bytes or {
-        (source.id, target.id): _partition_transfer_bytes(features, source, by_id[target_id])
-        for source in partitions
-        for target_id in source.succs
-        for target in [by_id[target_id]]
-    }
-    artificial_preds: dict[int, list[int]] = {pid: [] for pid in by_id}
-    for (source, target), is_original in edge_kinds.items():
-        if not is_original:
-            artificial_preds[target].append(source)
-    finish: dict[int, int] = {}
-    traffic = 0
-    bandwidth = 60
-    for pid in topo:
-        start = 0
-        for pred in by_id[pid].preds:
-            edge_bytes = transfer_bytes.get((pred, pid), 0)
-            same_core = core_of[pred] == core_of[pid]
-            if scenario == "q1":
-                delay = (100 if same_core else 1000) + math.ceil(edge_bytes / bandwidth)
-                traffic += edge_bytes
-            elif not same_core:
-                delay = 500 + math.ceil(edge_bytes / bandwidth)
-                traffic += edge_bytes
-            else:
-                delay = 0
-            start = max(start, finish[pred] + delay)
-        # Artificial same-core sequence edges have no tensor dependency and
-        # are already represented by the predecessor finish time.
-        for pred in artificial_preds[pid]:
-            start = max(start, finish[pred])
-        finish[pid] = start + by_id[pid].cycles
-
-    loads = [sum(by_id[pid].cycles for pid in order) for order in core_orders]
-    return max(finish.values(), default=0), traffic, max(loads, default=0) - min(loads, default=0)
-
-
-def optimize_schedule_move_swap(
-    partitions: list[Partition],
-    features: GraphFeatures,
-    core_of: dict[int, int],
-    core_orders: list[list[int]],
-    num_cores: int,
-    scenario: str,
-    max_iterations: int = 4,
-) -> tuple[dict[int, int], list[list[int]], dict[str, Any]]:
-    """Run a small deterministic best-improvement move/swap search."""
-    if num_cores < 2 or len(partitions) < 2 or max_iterations <= 0:
-        return core_of, core_orders, {"iterations": 0, "moves": 0}
-
-    current = [list(order) for order in core_orders]
-    by_id = {partition.id: partition for partition in partitions}
-    transfer_bytes = {
-        (source.id, target.id): _partition_transfer_bytes(features, source, target)
-        for source in partitions
-        for target_id in source.succs
-        for target in [by_id[target_id]]
-    }
-    current_score = _proxy_schedule_objective(
-        partitions, features, current, num_cores, scenario, transfer_bytes
-    )
-    if current_score is None:
-        return core_of, core_orders, {"iterations": 0, "moves": 0, "invalid_initial": True}
-
-    moves = 0
-    iterations = 0
-    by_id = {partition.id: partition for partition in partitions}
-    for _ in range(max_iterations):
-        iterations += 1
-        loads = [sum(by_id[pid].cycles for pid in order) for order in current]
-        busiest = max(range(num_cores), key=lambda core: (loads[core], -core))
-        candidate_best: tuple[tuple[float, int, int], list[list[int]], str] | None = None
-
-        # Move one task from the busiest core to another core.  Appending is
-        # sufficient for the minimal search; the validity check rejects cycles.
-        # Search the largest/most critical tasks first and cap the candidate
-        # set so the cheap local improvement remains practical on large DAGs.
-        candidate_pids = sorted(
-            current[busiest],
-            key=lambda pid: (-by_id[pid].cycles, -by_id[pid].rank_u, pid),
-        )[:12]
-        for pid in candidate_pids:
-            for target in range(num_cores):
-                if target == busiest:
-                    continue
-                candidate = [list(order) for order in current]
-                candidate[busiest].remove(pid)
-                candidate[target].append(pid)
-                score = _proxy_schedule_objective(
-                    partitions, features, candidate, num_cores, scenario, transfer_bytes
-                )
-                if score is not None and score < current_score:
-                    item = (score, candidate, f"move:{pid}:{busiest}->{target}")
-                    if candidate_best is None or item[0] < candidate_best[0]:
-                        candidate_best = item
-
-        # Also try pairwise swaps involving the busiest core.  This often
-        # fixes a bad critical-path placement without changing core loads.
-        for left_pid in candidate_pids:
-            for target in range(num_cores):
-                if target == busiest:
-                    continue
-                right_pids = sorted(
-                    current[target],
-                    key=lambda pid: (-by_id[pid].cycles, -by_id[pid].rank_u, pid),
-                )[:8]
-                for right_pid in right_pids:
-                    candidate = [list(order) for order in current]
-                    left_index = candidate[busiest].index(left_pid)
-                    right_index = candidate[target].index(right_pid)
-                    candidate[busiest][left_index] = right_pid
-                    candidate[target][right_index] = left_pid
-                    score = _proxy_schedule_objective(
-                        partitions, features, candidate, num_cores, scenario, transfer_bytes
-                    )
-                    if score is not None and score < current_score:
-                        item = (score, candidate, f"swap:{left_pid}:{right_pid}")
-                        if candidate_best is None or item[0] < candidate_best[0]:
-                            candidate_best = item
-
-        if candidate_best is None:
-            break
-        current_score, current, _ = candidate_best
-        moves += 1
-
-    selected_core_of = {
-        pid: core
-        for core, order in enumerate(current)
-        for pid in order
-    }
-    return selected_core_of, current, {
-        "iterations": iterations,
-        "moves": moves,
-        "proxy_score": current_score,
-    }
-
-
 def build_plan(
     graph: dict[str, Any],
     num_cores: int = 4,
     scenario: str = "q2",
-    partitioner: Partitioner | None = None,
-    scheduler: Scheduler | None = None,
-    schedule_optimizer: ScheduleOptimizer | None = None,
-    optimizer_iterations: int = 4,
     features: GraphFeatures | None = None,
-    partitions: Iterable[Partition] | None = None,
-    collect_scheduler_diagnostics: bool = False,
 ) -> AlgorithmResult:
-    """Build a plan from independently replaceable algorithm stages."""
-    if scheduler is None:
-        scheduler = schedule_partitions
+    """Build a plan with the complete strategy chosen by graph pattern."""
     if features is None:
         features = analyze_graph(graph)
-    if partitions is None:
-        partitions = build_partitions(features, partitioner=partitioner)
-    else:
-        partitions = _clone_partitions(partitions)
-    scheduled = scheduler(
-        partitions,
+    from .graph_patterns import GraphPatternFamily, classify_features
+
+    graph_pattern = classify_features(features)
+    strategies = {
+        GraphPatternFamily.WIDE: _semantic_plan,
+        GraphPatternFamily.NARROW: _semantic_plan,
+        GraphPatternFamily.MIXED: _semantic_plan,
+        GraphPatternFamily.COMPLEX: _semantic_plan,
+    }
+    partitions, core_orders, strategy_diagnostics = strategies[graph_pattern.family](
         features,
         num_cores,
         scenario,
-        return_diagnostics=collect_scheduler_diagnostics,
     )
-    if collect_scheduler_diagnostics:
-        core_of, core_orders, scheduler_diagnostics = scheduled
-    else:
-        core_of, core_orders = scheduled
-        scheduler_diagnostics = {"enabled": False}
-    optimizer_diagnostics = {"enabled": schedule_optimizer is not None, "iterations": 0, "moves": 0}
-    if schedule_optimizer is not None:
-        core_of, core_orders, optimizer_diagnostics = schedule_optimizer(
-            partitions,
-            features,
-            core_of,
-            core_orders,
-            num_cores,
-            scenario,
-            max_iterations=optimizer_iterations,
-        )
     node_to_subgraph = {
         str(op_id): partition.id
         for partition in partitions
         for op_id in partition.ops
     }
-    # The scheduler emits partition ids in each core's critical-path order.
     # Empty cores are intentionally retained in the output.
     return AlgorithmResult(
         plan={
@@ -768,8 +376,8 @@ def build_plan(
             "core_schedules": core_orders,
         },
         diagnostics={
-            "scheduler": scheduler_diagnostics,
-            "schedule_optimizer": optimizer_diagnostics,
+            "graph_pattern": graph_pattern.as_dict(),
+            "algorithm": strategy_diagnostics,
         },
     )
 
@@ -787,48 +395,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("graph", type=Path)
     parser.add_argument("-n", "--num-cores", type=int, default=4)
     parser.add_argument("--scenario", choices=("q1", "q2", "q3"), default="q2")
-    parser.add_argument(
-        "--partitioner",
-        default="subgraph.semantic_partition:semantic_partition",
-        help="partitioner 的 module:callable；默认使用 semantic_partition",
-    )
-    parser.add_argument(
-        "--scheduler",
-        default="subgraph.demo_framework:schedule_partitions",
-        help="scheduler 的 module:callable；默认使用 schedule_partitions",
-    )
-    parser.add_argument(
-        "--schedule-optimizer",
-        help="可选 schedule optimizer 的 module:callable",
-    )
     parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args(argv)
     graph = load_graph(args.graph)
-
-    def load_callable(spec: str, name: str) -> Any:
-        if ":" not in spec:
-            raise ValueError(f"{name} must use module:callable syntax")
-        module_name, function_name = spec.split(":", 1)
-        target = getattr(importlib.import_module(module_name), function_name, None)
-        if not callable(target):
-            raise TypeError(f"{name} is not callable: {spec}")
-        return target
-
-    partitioner = load_callable(args.partitioner, "partitioner")
-    scheduler = load_callable(args.scheduler, "scheduler")
-    schedule_optimizer = (
-        load_callable(args.schedule_optimizer, "schedule optimizer")
-        if args.schedule_optimizer
-        else None
-    )
-    result = build_plan(
-        graph,
-        args.num_cores,
-        args.scenario,
-        partitioner=partitioner,
-        scheduler=scheduler,
-        schedule_optimizer=schedule_optimizer,
-    )
+    result = build_plan(graph, args.num_cores, args.scenario)
     plan = result.plan
     output = args.output or args.graph.with_name(f"{args.graph.stem}_multicore_res.json")
     output.parent.mkdir(parents=True, exist_ok=True)

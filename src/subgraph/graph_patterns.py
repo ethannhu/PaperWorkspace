@@ -31,6 +31,15 @@ class GraphPattern(StrEnum):
     WIDE_MATMUL_ADD = "wide_matmul_add"
 
 
+class GraphPatternFamily(StrEnum):
+    """Coarse routing classes used by the algorithm framework."""
+
+    WIDE = "wide"
+    NARROW = "narrow"
+    MIXED = "mixed"
+    COMPLEX = "complex"
+
+
 _DISPLAY_NAMES = {
     GraphPattern.MIXED_MLP_REDUCE: "小/中型混合 MLP-Reduce 图",
     GraphPattern.SHALLOW_WIDE_COMPUTE_ACTIVATION: "浅层宽并行 MatMul-ReLU 图",
@@ -42,12 +51,24 @@ _DISPLAY_NAMES = {
 }
 
 
+_FAMILY_BY_PATTERN = {
+    GraphPattern.SHALLOW_WIDE_COMPUTE_ACTIVATION: GraphPatternFamily.WIDE,
+    GraphPattern.GATED_SIGMOID_MLP: GraphPatternFamily.WIDE,
+    GraphPattern.WIDE_MATMUL_ADD: GraphPatternFamily.WIDE,
+    GraphPattern.NARROW_DEEP_REDUCE_RELU_ADD: GraphPatternFamily.NARROW,
+    GraphPattern.MIXED_MLP_REDUCE: GraphPatternFamily.MIXED,
+    GraphPattern.CNN_RESIDUAL: GraphPatternFamily.COMPLEX,
+    GraphPattern.ATTENTION_NORMALIZE: GraphPatternFamily.COMPLEX,
+}
+
+
 @dataclass(frozen=True)
 class GraphPatternReport:
     """Classification plus the feature values needed to audit the decision."""
 
     pattern: GraphPattern
     display_name: str
+    family: GraphPatternFamily
     reason: str
     operator_count: int
     depth: int
@@ -59,6 +80,7 @@ class GraphPatternReport:
     def as_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["pattern"] = self.pattern.value
+        result["family"] = self.family.value
         return result
 
 
@@ -123,6 +145,7 @@ def classify_features(features: GraphFeatures) -> GraphPatternReport:
     return GraphPatternReport(
         pattern=pattern,
         display_name=_DISPLAY_NAMES[pattern],
+        family=_FAMILY_BY_PATTERN[pattern],
         reason=reason,
         operator_count=count,
         depth=depth,
@@ -136,6 +159,11 @@ def classify_features(features: GraphFeatures) -> GraphPatternReport:
 def classify_graph(graph: dict[str, Any]) -> GraphPatternReport:
     """Analyse a raw input graph and return its seven-class pattern report."""
     return classify_features(analyze_graph(graph))
+
+
+def family_for_pattern(pattern: GraphPattern) -> GraphPatternFamily:
+    """Return the coarse routing family for a fine-grained graph pattern."""
+    return _FAMILY_BY_PATTERN[pattern]
 
 
 def main(argv: list[str] | None = None) -> int:

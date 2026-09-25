@@ -7,9 +7,8 @@ The partitioner follows the design in ``docs/partition.md``:
 3. greedily merge blocks when communication and locality gains outweigh the
    loss of parallelism, then rebuild the partition DAG.
 
-It deliberately returns the same lightweight object shape used by the
-framework scheduler.  Keeping the algorithm here makes it independently
-testable without coupling its scoring rules to scheduling code.
+It deliberately returns the lightweight ``Partition`` objects consumed by the
+current family strategies.
 """
 
 from __future__ import annotations
@@ -543,7 +542,7 @@ def _merge_blocks(
 
 
 def build_partition_dag(features: GraphFeatures, blocks: dict[int, SemanticBlock]) -> list[Partition]:
-    """Convert semantic blocks into the scheduler's compact partition objects."""
+    """Convert semantic blocks into compact partition objects."""
     from .demo_framework import Partition
 
     ordered = sorted(blocks.values(), key=lambda block: (min(block.nodes), block.id))

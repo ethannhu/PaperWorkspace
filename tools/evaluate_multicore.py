@@ -86,23 +86,13 @@ def _prepare_reusable_context(
     algorithm: Callable[..., AlgorithmResult],
     graph: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build reusable analysis/partition inputs for algorithms that opt in."""
+    """Build reusable graph features for algorithms that opt in."""
     parameters = inspect.signature(algorithm).parameters
-    if "features" not in parameters and "partitions" not in parameters:
+    if "features" not in parameters:
         return {}
-    if "partitions" not in parameters:
-        from subgraph.demo_framework import analyze_graph
+    from subgraph.demo_framework import analyze_graph
 
-        return {"features": analyze_graph(graph)}
-    from subgraph.demo_framework import prepare_plan_context
-
-    context = prepare_plan_context(graph)
-    reusable: dict[str, Any] = {}
-    if "features" in parameters:
-        reusable["features"] = context.features
-    if "partitions" in parameters:
-        reusable["partitions"] = context.partitions
-    return reusable
+    return {"features": analyze_graph(graph)}
 
 
 def _run_evaluator(

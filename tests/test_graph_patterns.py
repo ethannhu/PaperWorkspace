@@ -6,7 +6,7 @@ import json
 import unittest
 from pathlib import Path
 
-from subgraph.graph_patterns import GraphPattern, classify_graph
+from subgraph.graph_patterns import GraphPattern, GraphPatternFamily, classify_graph
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,9 +37,12 @@ class GraphPatternClassifierTests(unittest.TestCase):
             "case_100": GraphPattern.MIXED_MLP_REDUCE,
         }
         observed = {}
+        observed_families = set()
         for case, pattern in expected.items():
             graph = json.loads((ROOT / "artifacts/excases" / f"{case}.json").read_text())
-            observed[case] = classify_graph(graph).pattern
+            report = classify_graph(graph)
+            observed[case] = report.pattern
+            observed_families.add(report.family)
             self.assertEqual(pattern, observed[case], case)
         self.assertEqual(set(GraphPattern), set(observed.values()))
-
+        self.assertEqual(set(GraphPatternFamily), observed_families)

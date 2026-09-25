@@ -1,36 +1,34 @@
 # Algorithm framework
 
-The planning pipeline is intentionally small and uses callable injection:
+The planning pipeline exposes one algorithm entry point:
 
 ```python
 from subgraph.demo_framework import build_plan
-from subgraph.naive_partition import naive_partition
 
-result = build_plan(graph, partitioner=naive_partition)
+result = build_plan(graph, num_cores=4, scenario="q2")
 plan = result.plan
 diagnostics = result.diagnostics
 ```
 
-`build_plan` has three stages:
+`build_plan` does four things:
 
-1. `analyze_graph(graph)` produces `GraphFeatures`.
-2. `partitioner(features, max_ops, max_cycles)` produces `list[Partition]`.
-3. `scheduler(partitions, features, num_cores, scenario, return_diagnostics=False)`
-   produces core placement and per-core order. Expensive scheduler diagnostics
-   are collected only when `build_plan(..., collect_scheduler_diagnostics=True)`
-   is requested.
+1. `analyze_graph(graph)` builds the COPY-contracted op DAG.
+2. `classify_features(features)` assigns the graph to one fine pattern and one
+   coarse family: `wide`, `narrow`, `mixed`, or `complex`.
+3. The selected family strategy owns both partitioning and scheduling.
+4. The result is returned as `AlgorithmResult(plan, diagnostics)`.
 
-An optional `schedule_optimizer` can refine the scheduler result. The complete
-algorithm result is an `AlgorithmResult` containing `plan` and `diagnostics`.
-The evaluation framework writes the collected diagnostics to
-`case_xxx/diagnostics.json`; new experiments should provide a callable for only
-the stage they change. There is no command-line diagnostics path or
-algorithm-name dispatch in the pipeline.
+Scheduling is not a replaceable framework stage.  It is part of the selected
+strategy because placement choices depend on how that strategy formed
+partitions.  The current four family branches all call the same semantic
+strategy internally; later work should replace a whole family strategy rather
+than mixing an unrelated partitioner with an unrelated scheduler.
 
-The command-line entry point accepts the same stages as `module:callable`:
+The command-line entry point mirrors the same simple path:
 
 ```text
-python -m subgraph.demo_framework graph.json \
-  --partitioner my_experiment:partition \
-  --scheduler my_experiment:schedule
+python -m subgraph.demo_framework graph.json -n 4 --scenario q2 -o plan.json
 ```
+
+Diagnostics contain the graph-pattern report and the selected algorithm
+strategy name, which is enough to audit pattern routing during benchmarks.
