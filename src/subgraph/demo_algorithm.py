@@ -258,9 +258,35 @@ def _complex_plan(
     critical_cycles = sum(partitions[pid].cycles for pid in critical_path)
     from .graph_patterns import GraphPattern
 
-    if pattern == GraphPattern.CNN_RESIDUAL and critical_cycles > 50000:
-        core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
-        scheduler = "plain_list_after_complex_fusion"
+    # A narrow/deep CNN can be a replicated family of independent residual
+    # branches.  Protecting one arbitrary branch with sticky affinity leaves
+    # one core nearly idle and overloads another.  Preserve branch parallelism
+    # for this shape; wider CNNs and truly serial residual spines keep the
+    # critical-path scheduler.
+    layer_width = max(
+        (
+            sum(features.depth[node] == level for node in features.topo_order)
+            for level in set(features.depth.values())
+        ),
+        default=0,
+    )
+    replicated_narrow_cnn = (
+        pattern == GraphPattern.CNN_RESIDUAL
+        and max(features.depth.values(), default=0) >= 80
+        and layer_width <= 16
+    )
+    if (
+        replicated_narrow_cnn
+        or pattern == GraphPattern.CNN_RESIDUAL and critical_cycles > 50000
+    ):
+        if replicated_narrow_cnn:
+            core_orders = _schedule_replicated_components(
+                partitions, num_cores
+            )
+            scheduler = "balanced_replicated_component_list"
+        else:
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+            scheduler = "plain_list_after_complex_fusion"
     else:
         core_orders = _schedule_complex_partitions(
             partitions,
@@ -276,6 +302,8 @@ def _complex_plan(
         "partition_count": len(partitions),
         "critical_path_length": len(critical_path),
         "critical_path_cycles": critical_cycles,
+        "max_layer_width": layer_width,
+        "replicated_narrow_cnn": replicated_narrow_cnn,
     }
 
 
@@ -339,6 +367,75 @@ def _partition_topology(partitions: list[Partition]) -> list[int]:
     preds = {p.id: set(p.preds) for p in partitions}
     succs = {p.id: set(p.succs) for p in partitions}
     return _topological_order([p.id for p in partitions], preds, succs)
+
+
+def _schedule_replicated_components(
+    partitions: list[Partition],
+    num_cores: int,
+) -> list[list[int]]:
+    """Pack disconnected branch components without splitting a branch.
+
+    Narrow/deep residual inputs often contain replicated independent chains.
+    Their partition DAG has no edges between replicas, so treating every
+    partition as an independent ready task can interleave branches and create
+    avoidable memory-pipeline dependencies.  Keep each component contiguous
+    and use largest-processing-time-first packing across cores.
+    """
+    if num_cores < 1:
+        raise ValueError("num_cores must be positive")
+    if not partitions:
+        return [[] for _ in range(num_cores)]
+
+    by_id = {partition.id: partition for partition in partitions}
+    neighbours = {
+        partition.id: partition.preds | partition.succs
+        for partition in partitions
+    }
+    components: list[list[int]] = []
+    unseen = set(by_id)
+    while unseen:
+        start = min(unseen)
+        unseen.remove(start)
+        stack = [start]
+        component: list[int] = []
+        while stack:
+            pid = stack.pop()
+            component.append(pid)
+            for neighbour in neighbours[pid] & unseen:
+                unseen.remove(neighbour)
+                stack.append(neighbour)
+        components.append(component)
+
+    topo = _partition_topology(partitions)
+    topo_index = {pid: index for index, pid in enumerate(topo)}
+    ordered_components: list[tuple[int, list[int], int]] = []
+    for component in components:
+        ordered = sorted(component, key=topo_index.__getitem__)
+        work = sum(by_id[pid].cycles for pid in ordered)
+        ordered_components.append((work, ordered, min(ordered)))
+    ordered_components.sort(key=lambda item: (-item[0], item[2]))
+
+    assigned_components: list[list[list[int]]] = [
+        [] for _ in range(num_cores)
+    ]
+    core_load = [0] * num_cores
+    for work, component, _ in ordered_components:
+        core = min(range(num_cores), key=lambda index: (core_load[index], index))
+        assigned_components[core].append(component)
+        core_load[core] += work
+
+    # Keep replicas interleaved by stage.  Concatenating whole components
+    # serializes one branch before touching the next and defeats Q2/Q3
+    # same-core tensor reuse, especially when all components share a core.
+    core_orders: list[list[int]] = []
+    for components in assigned_components:
+        order: list[int] = []
+        for index in range(max((len(component) for component in components), default=0)):
+            for component in components:
+                if index < len(component):
+                    order.append(component[index])
+        core_orders.append(order)
+    return core_orders
 
 
 def _critical_partition_path(
@@ -680,4 +777,3 @@ def build_algorithm_plan(
             "algorithm": strategy_diagnostics,
         },
     )
-

@@ -34,6 +34,22 @@ class MixedAlgorithmTests(unittest.TestCase):
                 set(plan["node_to_subgraph"].values()), set(scheduled), path.name
             )
 
+    def test_narrow_replicated_cnn_keeps_branch_components_balanced(self) -> None:
+        graph = json.loads(
+            (ROOT / "artifacts/excases/case_044.json").read_text(encoding="utf-8")
+        )
+        result = build_plan(graph, num_cores=4, scenario="q2")
+        plan = result.plan
+        algorithm = result.diagnostics["algorithm"]
+
+        self.assertEqual(
+            algorithm["scheduler"], "balanced_replicated_component_list"
+        )
+        self.assertEqual(
+            [len(schedule) for schedule in plan["core_schedules"]],
+            [150, 150, 150, 100],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
