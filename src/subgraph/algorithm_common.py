@@ -210,6 +210,162 @@ def _edge_size(features: GraphFeatures, source: int, target: int) -> int:
     return features.edge_sizes.get((source, target), 0)
 
 
+def _partition_edge_size(
+    partitions: list[Partition],
+    features: GraphFeatures,
+    source: int,
+    target: int,
+) -> int:
+    """Return the largest known tensor edge between two partitions."""
+    source_ops = partitions[source].ops
+    target_ops = partitions[target].ops
+    return max(
+        (
+            _edge_size(features, source_op, target_op)
+            for source_op in source_ops
+            for target_op in target_ops
+            if target_op in features.succs[source_op]
+        ),
+        default=0,
+    )
+
+
+def rebalance_core_orders(
+    partitions: list[Partition],
+    features: GraphFeatures,
+    core_orders: list[list[int]],
+    scenario: str,
+    max_rounds: int = 3,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    """Improve a completed schedule with bounded whole-partition migration.
+
+    The regular schedulers are greedy and make a local core decision for every
+    ready partition.  This pass treats that result as a starting point and
+    searches migrations from the heaviest core to the lightest cores.  A move
+    is accepted only when the replayed dependency schedule improves a scalar
+    estimate that combines makespan and a small communication term.  Orders
+    are rebuilt in partition-topological order after every trial, so moving a
+    partition cannot introduce a same-core dependency cycle.
+    """
+    if not core_orders or not partitions:
+        return core_orders, {"enabled": True, "moves": 0}
+    if scenario not in {"q1", "q2", "q3"}:
+        raise ValueError("scenario must be q1, q2, or q3")
+
+    by_id = {partition.id: partition for partition in partitions}
+    topo = _topological_order(
+        by_id,
+        {partition.id: set(partition.preds) for partition in partitions},
+        {partition.id: set(partition.succs) for partition in partitions},
+    )
+    topo_position = {pid: index for index, pid in enumerate(topo)}
+    owner = {
+        pid: core
+        for core, order in enumerate(core_orders)
+        for pid in order
+    }
+    # Defensive completion for malformed/empty schedules; normal plans already
+    # contain every partition exactly once.
+    for pid in topo:
+        owner.setdefault(pid, min(range(len(core_orders)), key=lambda c: c))
+
+    def rebuild(current_owner: dict[int, int]) -> list[list[int]]:
+        orders = [[] for _ in core_orders]
+        for pid in topo:
+            orders[current_owner[pid]].append(pid)
+        return orders
+
+    def replay(current_owner: dict[int, int]) -> tuple[float, int, int, float]:
+        orders = rebuild(current_owner)
+        previous: dict[int, int] = {}
+        finish: dict[int, int] = {}
+        edge_bytes = 0
+        for core, order in enumerate(orders):
+            for index, pid in enumerate(order):
+                previous[pid] = order[index - 1] if index else -1
+        for pid in topo:
+            core = current_owner[pid]
+            ready = 0
+            for pred in by_id[pid].preds:
+                pred_core = current_owner[pred]
+                cross = pred_core != core
+                bytes_ = _partition_edge_size(partitions, features, pred, pid)
+                if cross:
+                    edge_bytes += bytes_
+                if scenario == "q1":
+                    delay = (100 if not cross else 1000) + math.ceil(bytes_ / 60)
+                else:
+                    delay = (500 + math.ceil(bytes_ / 60)) if cross else 0
+                ready = max(ready, finish[pred] + delay)
+            previous_finish = finish.get(previous[pid], 0)
+            # Scene A releases the next Task on a core only after the
+            # configured same-core Task wait.  This is a queueing constraint,
+            # not a data-edge cost, so it applies even to unrelated Tasks.
+            if scenario == "q1" and previous[pid] != -1:
+                previous_finish += 100
+            finish[pid] = max(ready, previous_finish) + by_id[pid].cycles
+        loads = [
+            sum(by_id[pid].cycles for pid in order)
+            for order in orders
+        ]
+        makespan = max(finish.values(), default=0)
+        max_load = max(loads, default=0)
+        # Communication is a secondary term: compute/dependency time remains
+        # dominant, while large migrations are discouraged when equal in time.
+        score = makespan + 0.10 * edge_bytes / 60.0
+        return score, edge_bytes, max_load, makespan
+
+    initial = replay(owner)
+    current = initial
+    moves = 0
+    rounds = 0
+    candidate_limit = 24
+    while rounds < max_rounds:
+        rounds += 1
+        orders = rebuild(owner)
+        loads = [
+            sum(by_id[pid].cycles for pid in order)
+            for order in orders
+        ]
+        source = max(range(len(orders)), key=lambda core: (loads[core], -core))
+        targets = sorted(
+            (core for core in range(len(orders)) if core != source),
+            key=lambda core: (loads[core], core),
+        )
+        if not targets or loads[source] <= loads[targets[0]]:
+            break
+        candidates = sorted(
+            orders[source],
+            key=lambda pid: (-by_id[pid].cycles, topo_position[pid]),
+        )[:candidate_limit]
+        best_owner = None
+        best = current
+        for pid in candidates:
+            for target in targets:
+                trial_owner = dict(owner)
+                trial_owner[pid] = target
+                trial = replay(trial_owner)
+                if trial[0] + 1e-9 < best[0]:
+                    best = trial
+                    best_owner = trial_owner
+        if best_owner is None:
+            break
+        owner = best_owner
+        current = best
+        moves += 1
+
+    result = rebuild(owner)
+    final = replay(owner)
+    return result, {
+        "enabled": True,
+        "moves": moves,
+        "rounds": rounds,
+        "estimated_before": initial[3],
+        "estimated_after": final[3],
+        "estimated_cross_bytes": final[1],
+    }
+
+
 def describe_graph_pattern(features: GraphFeatures) -> dict[str, Any]:
     """Return the graph-pattern diagnostics emitted with each plan."""
     from .graph_patterns import classify_features
@@ -224,4 +380,5 @@ __all__ = [
     "analyze_graph",
     "classify_op",
     "describe_graph_pattern",
+    "rebalance_core_orders",
 ]

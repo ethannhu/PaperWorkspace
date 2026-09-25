@@ -15,6 +15,7 @@ from .algorithm_common import (
     _edge_size,
     _topological_order,
     analyze_graph,
+    rebalance_core_orders,
 )
 from .interfaces import AlgorithmResult
 
@@ -851,6 +852,11 @@ def build_algorithm_plan(features: GraphFeatures, num_cores: int = 4) -> Algorit
         partitions, core_orders, diagnostics = _semantic_plan(
             features, num_cores, "q1"
         )
+
+    core_orders, rebalance_diagnostics = rebalance_core_orders(
+        partitions, features, core_orders, "q1"
+    )
+    diagnostics["global_rebalance"] = rebalance_diagnostics
 
     node_to_subgraph = {
         str(op_id): partition.id

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -580,7 +581,23 @@ def semantic_partition(
     blocks, node_features = _build_stage_blocks(features)
     _merge_blocks(features, blocks, node_features, max_ops, max_cycles)
     if enable_singleton_repair:
+        # The repair pass is intentionally more permissive than the strict
+        # merger.  Keep a valid checkpoint: merging two individually valid
+        # blocks can still make their quotient graph cyclic through an
+        # alternate path in a non-convex region.
+        blocks_before_repair = deepcopy(blocks)
         repair_singleton_blocks(features, blocks, node_features, max_ops, max_cycles)
+        repaired = build_partition_dag(features, blocks)
+        from .algorithm_common import _topological_order
+
+        try:
+            _topological_order(
+                [partition.id for partition in repaired],
+                {partition.id: set(partition.preds) for partition in repaired},
+                {partition.id: set(partition.succs) for partition in repaired},
+            )
+        except ValueError:
+            blocks = blocks_before_repair
     return build_partition_dag(features, blocks)
 
 
