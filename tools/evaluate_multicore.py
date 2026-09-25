@@ -1,23 +1,15 @@
-"""Run one partition/scheduling algorithm through the official Q1--Q3 evaluators.
+"""Run the default Q1--Q3 algorithms through the official evaluators.
 
-The algorithm is supplied as ``module:callable`` and must return the standard
-multicore plan dictionary.  The runner evaluates one-core baseline plus 2--5
-cores, keeps every individual plan/evaluator result, writes one aggregate JSON
-file, and saves a ``speedup.png`` plot.  When no graph is supplied, the runner
-discovers and evaluates ``case_*.json`` files under ``artifacts/data`` and
-displays case-level progress with tqdm; batch mode writes only each case's own
-artifacts and no cross-case summary.
+The runner discovers and evaluates ``case_*.json`` files under the input
+directory.  Each case uses the ``config.txt`` in that same directory, keeps
+every individual plan/evaluator result, writes one aggregate JSON file, and
+saves a ``speedup.png`` plot.
 
 Example::
 
     PYTHONPATH=src uv run tools/evaluate_multicore.py \
-        artifacts/data/case_001.json \
-        --algorithm subgraph.demo_framework:build_plan \
-        --config artifacts/data/config.txt \
-        -o results/case_001
-
-    PYTHONPATH=src uv run tools/evaluate_multicore.py \
-        --algorithm subgraph.demo_framework:build_plan
+        --cases-dir artifacts/data \
+        -o results/multicore_cases
 """
 
 from __future__ import annotations
@@ -42,8 +34,13 @@ from subgraph.interfaces import AlgorithmResult
 
 PROBLEMS = (1, 2, 3)
 CORE_COUNTS = (1, 2, 3, 4, 5)
-DEFAULT_WORKERS = 4
-DEFAULT_EVALUATOR_TIMEOUT_SECONDS = 600
+WORKERS = 4
+EVALUATOR_TIMEOUT_SECONDS = 600
+DEFAULT_ALGORITHMS = {
+    "q1": "subgraph.q1_algorithm:build_plan",
+    "q2": "subgraph.q2_algorithm:build_plan",
+    "q3": "subgraph.q3_algorithm:build_plan",
+}
 
 
 def _load_callable(spec: str) -> Callable[..., AlgorithmResult]:
@@ -90,7 +87,7 @@ def _prepare_reusable_context(
     parameters = inspect.signature(algorithm).parameters
     if "features" not in parameters:
         return {}
-    from subgraph.demo_framework import analyze_graph
+    from subgraph.demo_algorithm import analyze_graph
 
     return {"features": analyze_graph(graph)}
 
@@ -101,7 +98,7 @@ def _run_evaluator(
     plan: Path,
     config: Path,
     output: Path,
-    timeout_seconds: int | None = DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
+    timeout_seconds: int | None = EVALUATOR_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], str]:
     trace = output.with_name(output.stem + "_trace.json")
     log = output.with_name(output.stem + "_log.txt")
@@ -381,12 +378,12 @@ def _graph_theoretical_metrics(
 
 def evaluate(
     graph_path: Path,
-    algorithm_spec: str,
+    algorithm_specs: dict[str, str],
     config_path: Path,
     output_dir: Path,
     cores: tuple[int, ...] = CORE_COUNTS,
     problems: tuple[int, ...] = PROBLEMS,
-    evaluator_timeout: int | None = DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
+    evaluator_timeout: int | None = EVALUATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     graph_path = graph_path.resolve()
     config_path = config_path.resolve()
@@ -398,8 +395,14 @@ def evaluate(
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     bandwidth = _read_bandwidth(config_path)
     theoretical_metrics = _graph_theoretical_metrics(graph, bandwidth, cores)
-    algorithm = _load_callable(algorithm_spec)
-    reusable_context = _prepare_reusable_context(algorithm, graph)
+    algorithms = {
+        scenario: _load_callable(spec)
+        for scenario, spec in algorithm_specs.items()
+    }
+    reusable_contexts = {
+        scenario: _prepare_reusable_context(algorithm, graph)
+        for scenario, algorithm in algorithms.items()
+    }
     repo_root = Path(__file__).resolve().parents[1]
     evaluator_dir = repo_root / "artifacts" / "code"
 
@@ -410,11 +413,11 @@ def evaluate(
         for problem in problems:
             scenario = f"q{problem}"
             result = _call_algorithm(
-                algorithm,
+                algorithms[scenario],
                 graph,
                 num_cores,
                 scenario,
-                reusable_context,
+                reusable_contexts[scenario],
             )
             plan_path = input_dir / f"plan_{scenario}_{num_cores}cores.json"
             plan_path.write_text(json.dumps(result.plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -461,7 +464,7 @@ def evaluate(
 
     aggregate = {
         "graph": str(graph_path),
-        "algorithm": algorithm_spec,
+        "algorithm": algorithm_specs,
         "config": str(config_path),
         "core_counts": list(cores),
         "baseline_core_count": 1,
@@ -478,7 +481,7 @@ def evaluate(
     diagnostics_path.write_text(
         json.dumps(
             {
-                "algorithm": algorithm_spec,
+                "algorithm": algorithm_specs,
                 "runs": diagnostics_runs,
             },
             ensure_ascii=False,
@@ -512,13 +515,12 @@ def discover_cases(cases_dir: Path) -> list[Path]:
 
 def evaluate_cases(
     graph_paths: list[Path],
-    algorithm_spec: str,
+    algorithm_specs: dict[str, str],
     output_dir: Path,
-    config_path: Path | None = None,
     cores: tuple[int, ...] = CORE_COUNTS,
     problems: tuple[int, ...] = PROBLEMS,
-    workers: int = DEFAULT_WORKERS,
-    evaluator_timeout: int | None = DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
+    workers: int = WORKERS,
+    evaluator_timeout: int | None = EVALUATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Evaluate cases concurrently, keeping only per-case output artifacts."""
     if workers < 1:
@@ -531,11 +533,11 @@ def evaluate_cases(
     futures = {}
     for index, graph_path in enumerate(graph_paths):
         case_output_dir = output_dir / graph_path.stem
-        case_config = config_path or graph_path.parent / "config.txt"
+        case_config = graph_path.parent / "config.txt"
         future = executor.submit(
             evaluate,
             graph_path,
-            algorithm_spec,
+            algorithm_specs,
             case_config,
             case_output_dir,
             cores,
@@ -587,7 +589,7 @@ def evaluate_cases(
     cases = [item for item in case_results if item is not None]
     successful = sum(item["status"] == "ok" for item in cases)
     return {
-        "algorithm": algorithm_spec,
+        "algorithm": algorithm_specs,
         "successful": successful,
         "failed": len(cases) - successful,
         "workers": workers,
@@ -716,31 +718,13 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="运行 Q1-Q3 多核算法评测；省略 graph 时自动评测 cases 目录下全部 case"
+        description="批量运行 Q1-Q3 多核算法评测",
     )
-    parser.add_argument(
-        "graph",
-        type=Path,
-        nargs="?",
-        help="单个计算图 JSON；省略时进入批量模式",
-    )
-    parser.add_argument(
-        "--algorithm",
-        default="subgraph.demo_framework:build_plan",
-        help="算法入口 module:callable，默认使用 demo_framework:build_plan",
-    )
-    parser.add_argument("--config", type=Path, help="评测 config.txt")
     parser.add_argument(
         "--cases-dir",
         type=Path,
         default=Path(__file__).resolve().parents[1] / "artifacts" / "data",
-        help="批量模式的 case 目录；默认 artifacts/data",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help=f"批量模式并发线程数；默认 {DEFAULT_WORKERS}",
+        help="case 输入目录；默认 artifacts/data",
     )
     parser.add_argument(
         "-o",
@@ -762,58 +746,24 @@ def main(argv: list[str] | None = None) -> int:
         choices=PROBLEMS,
         default=list(PROBLEMS),
     )
-    parser.add_argument(
-        "--evaluator-timeout",
-        type=int,
-        default=DEFAULT_EVALUATOR_TIMEOUT_SECONDS,
-        help=(
-            "单次官方 evaluator 子进程超时秒数；"
-            f"默认 {DEFAULT_EVALUATOR_TIMEOUT_SECONDS}，设为 0 表示不限制"
-        ),
-    )
     args = parser.parse_args(argv)
     if 1 not in args.cores:
         args.cores = [1, *args.cores]
-    if args.evaluator_timeout < 0:
-        raise ValueError("--evaluator-timeout must be non-negative")
 
     cores = tuple(sorted(set(args.cores)))
     problems = tuple(args.problems)
-    evaluator_timeout = args.evaluator_timeout or None
-    if args.graph is None:
-        output_dir = args.output_dir or Path("results/multicore_cases")
-        graph_paths = discover_cases(args.cases_dir)
-        batch = evaluate_cases(
-            graph_paths,
-            args.algorithm,
-            output_dir,
-            args.config,
-            cores,
-            problems,
-            workers=args.workers,
-            evaluator_timeout=evaluator_timeout,
-        )
-        return 1 if batch["failed"] else 0
-
-    output_dir = args.output_dir or Path("results") / args.graph.stem
-    config = args.config or args.graph.parent / "config.txt"
-    aggregate = evaluate(
-        args.graph,
-        args.algorithm,
-        config,
+    output_dir = args.output_dir or Path("results/multicore_cases")
+    graph_paths = discover_cases(args.cases_dir)
+    batch = evaluate_cases(
+        graph_paths,
+        DEFAULT_ALGORITHMS,
         output_dir,
         cores,
         problems,
-        evaluator_timeout,
+        WORKERS,
+        EVALUATOR_TIMEOUT_SECONDS,
     )
-    figure_outputs = [str(plot_speedup(aggregate, output_dir))]
-    print(json.dumps({
-        "aggregate": str(output_dir / "aggregate.json"),
-        "runs": len(aggregate["runs"]),
-        "baseline_makespan": aggregate["baseline_makespan"],
-        "figure_outputs": figure_outputs,
-    }, ensure_ascii=False))
-    return 0
+    return 1 if batch["failed"] else 0
 
 
 if __name__ == "__main__":

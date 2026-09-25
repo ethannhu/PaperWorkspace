@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from subgraph.demo_framework import build_plan
+from subgraph.q2_algorithm import build_plan
 from subgraph.graph_patterns import GraphPattern, classify_graph
 
 
@@ -21,7 +21,7 @@ class MixedAlgorithmTests(unittest.TestCase):
 
         self.assertEqual(len(mixed), 22)
         for path, graph in mixed:
-            result = build_plan(graph, num_cores=4, scenario="q2")
+            result = build_plan(graph, num_cores=4)
             plan = result.plan
             diagnostics = result.diagnostics["algorithm"]
             self.assertEqual(
@@ -38,7 +38,7 @@ class MixedAlgorithmTests(unittest.TestCase):
         graph = json.loads(
             (ROOT / "artifacts/excases/case_044.json").read_text(encoding="utf-8")
         )
-        result = build_plan(graph, num_cores=4, scenario="q2")
+        result = build_plan(graph, num_cores=4)
         plan = result.plan
         algorithm = result.diagnostics["algorithm"]
 

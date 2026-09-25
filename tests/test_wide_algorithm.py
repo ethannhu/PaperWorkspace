@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from subgraph.demo_framework import build_plan
+from subgraph.q2_algorithm import build_plan
 from subgraph.graph_patterns import GraphPattern, classify_graph
 
 
@@ -19,7 +19,7 @@ class WideAlgorithmTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            result = build_plan(graph, num_cores=4, scenario="q2")
+            result = build_plan(graph, num_cores=4)
             self.assertEqual(
                 classify_graph(graph).family.value,
                 "wide",
@@ -42,7 +42,7 @@ class WideAlgorithmTests(unittest.TestCase):
         graph = json.loads(
             (ROOT / "artifacts/excases/case_058.json").read_text(encoding="utf-8")
         )
-        result = build_plan(graph, num_cores=4, scenario="q2")
+        result = build_plan(graph, num_cores=4)
         algorithm = result.diagnostics["algorithm"]
         self.assertEqual(algorithm["motif"], "matmul_add_fan_in")
         self.assertLess(algorithm["partition_count"], algorithm["base_partition_count"])

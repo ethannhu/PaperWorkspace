@@ -1,11 +1,11 @@
-# Algorithm framework
+# Algorithm entry points
 
 The planning pipeline exposes one algorithm entry point:
 
 ```python
-from subgraph.demo_framework import build_plan
+from subgraph.q2_algorithm import build_plan
 
-result = build_plan(graph, num_cores=4, scenario="q2")
+result = build_plan(graph, num_cores=4)
 plan = result.plan
 diagnostics = result.diagnostics
 ```
@@ -37,10 +37,12 @@ fusion with critical-path protection:
 - for very long CNN residual spines, keep the complex fusion but fall back to
   plain list scheduling to preserve convolution-level parallelism.
 
-The command-line entry point mirrors the same simple path:
+The batch evaluator selects the question-specific entry points directly:
 
 ```text
-python -m subgraph.demo_framework graph.json -n 4 --scenario q2 -o plan.json
+subgraph.q1_algorithm:build_plan
+subgraph.q2_algorithm:build_plan
+subgraph.q3_algorithm:build_plan
 ```
 
 Diagnostics contain the graph-pattern report and the selected algorithm
