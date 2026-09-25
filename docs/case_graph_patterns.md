@@ -273,3 +273,27 @@ case 列表：
 | 小型混合与极深链类 | 1、6 | 一类是中小规模混合图，另一类是极窄超深串行链 |
 
 实际实验分析中，建议使用七类作为分层统计口径；在正文叙述中使用四类概括总体规律。
+
+## 程序化识别
+
+`subgraph.graph_patterns` 将以上七类实现为基于输入图本身的可解释分类器：先复用
+`analyze_graph()` 折叠 COPY 节点得到 op-DAG，再计算算子占比、深度、最大层宽及
+分支/汇合比例。规则按专属 motif 优先匹配（极窄深链、门控、MatMul-Add、
+Attention/Normalize、宽浅、CNN/Residual），其余归入混合 MLP-Reduce 类。
+
+Python 调用：
+
+```python
+from subgraph.graph_patterns import classify_graph
+
+report = classify_graph(graph)
+print(report.pattern, report.reason)
+```
+
+也可直接输出 JSON 报告：
+
+```bash
+PYTHONPATH=src uv run python -m subgraph.graph_patterns artifacts/data/case_001.json
+```
+
+报告同时包含分类理由与全部分类特征，便于对未见输入图审计阈值和诊断边界样本。

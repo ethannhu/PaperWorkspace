@@ -42,7 +42,6 @@ from subgraph.interfaces import AlgorithmResult
 
 PROBLEMS = (1, 2, 3)
 CORE_COUNTS = (1, 2, 3, 4, 5)
-DEFAULT_CASE_COUNT = 20
 DEFAULT_WORKERS = 4
 DEFAULT_EVALUATOR_TIMEOUT_SECONDS = 600
 
@@ -501,27 +500,24 @@ def evaluate(
     return aggregate
 
 
-def discover_cases(cases_dir: Path, case_count: int = DEFAULT_CASE_COUNT) -> list[Path]:
+def discover_cases(cases_dir: Path) -> list[Path]:
     """Return only input graphs named exactly ``case_<number>.json``.
 
     Evaluators may leave files such as ``case_001_problem_1_trace.json`` in
     the same directory.  A broad ``case_*.json`` glob would incorrectly treat
     those artifacts as additional graph inputs.
     """
-    if case_count < 1:
-        raise ValueError("case_count must be at least 1")
     cases_dir = cases_dir.resolve()
     graph_paths = sorted(
         path
         for path in cases_dir.glob("case_*.json")
         if re.fullmatch(r"case_[0-9]+\.json", path.name)
     )
-    if len(graph_paths) < case_count:
+    if not graph_paths:
         raise FileNotFoundError(
-            f"expected at least {case_count} case_<number>.json files in {cases_dir}, "
-            f"found {len(graph_paths)}"
+            f"expected at least one case_<number>.json file in {cases_dir}"
         )
-    return graph_paths[:case_count]
+    return graph_paths
 
 
 def evaluate_cases(
@@ -602,8 +598,6 @@ def evaluate_cases(
     successful = sum(item["status"] == "ok" for item in cases)
     return {
         "algorithm": algorithm_spec,
-        "case_count": len(cases),
-        "requested_case_count": len(graph_paths),
         "successful": successful,
         "failed": len(cases) - successful,
         "workers": workers,
@@ -732,13 +726,13 @@ def plot_speedup(aggregate: dict[str, Any], output_dir: Path) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description=f"运行 Q1-Q3 多核算法评测；省略 graph 时自动评测 {DEFAULT_CASE_COUNT} 个 cases"
+        description="运行 Q1-Q3 多核算法评测；省略 graph 时自动评测 cases 目录下全部 case"
     )
     parser.add_argument(
         "graph",
         type=Path,
         nargs="?",
-        help="单个计算图 JSON；省略时进入 100 cases 批量模式",
+        help="单个计算图 JSON；省略时进入批量模式",
     )
     parser.add_argument(
         "--algorithm",
@@ -753,12 +747,6 @@ def main(argv: list[str] | None = None) -> int:
         help="批量模式的 case 目录；默认 artifacts/data",
     )
     parser.add_argument(
-        "--case-count",
-        type=int,
-        default=DEFAULT_CASE_COUNT,
-        help=f"批量模式评测的 case 数；默认 {DEFAULT_CASE_COUNT}",
-    )
-    parser.add_argument(
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
@@ -768,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         "-o",
         "--output-dir",
         type=Path,
-        help="输出目录；批量模式默认 results/multicore_100cases",
+        help="输出目录；批量模式默认 results/multicore_cases",
     )
     parser.add_argument(
         "--cores",
@@ -803,8 +791,8 @@ def main(argv: list[str] | None = None) -> int:
     problems = tuple(args.problems)
     evaluator_timeout = args.evaluator_timeout or None
     if args.graph is None:
-        output_dir = args.output_dir or Path("results/multicore_100cases")
-        graph_paths = discover_cases(args.cases_dir, args.case_count)
+        output_dir = args.output_dir or Path("results/multicore_cases")
+        graph_paths = discover_cases(args.cases_dir)
         batch = evaluate_cases(
             graph_paths,
             args.algorithm,
