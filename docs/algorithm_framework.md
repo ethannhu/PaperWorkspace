@@ -35,7 +35,7 @@ Q2 使用 `q2` 通信模型：同核子图之间不产生跨核 COPY，跨核依
 
 ### Q3
 
-Q3 复用 Q2 的图模式和调度策略，但明确以 `scenario="q3"` 构造方案，并在诊断中标记只读 FIFO Cache 模型。Q3 的 Cache 命中、容量淘汰和 Cache 带宽由官方问题 3 评估器处理，算法不自行模拟 Cache。
+Q3 复用 Q2 的图模式和调度策略，但明确以 `scenario="q3"` 构造方案。对分类为 `CNN_RESIDUAL` 或 `GATED_SIGMOID_MLP` 的分支图，ready 队列会在关键路径优先的前提下提高重复输入 Tensor 的优先级，以增加 FIFO Cache 的局部复用；其他图保持 Q2 顺序。Q3 的 Cache 命中、容量淘汰和 Cache 带宽由官方问题 3 评估器处理，算法不自行模拟 Cache。
 
 ## 当前策略分支
 

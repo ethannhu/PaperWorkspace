@@ -1,4 +1,8 @@
-"""Question 2 partitioning and scheduling algorithm."""
+"""Q2 独立分区与调度算法。
+
+Q2 负责普通多核执行场景；本文件包含自己的分区、调度和入口逻辑，
+不依赖 Q1 或 Q3 的算法模块。
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ def _semantic_plan(
     num_cores: int,
     scenario: str,
 ) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
+    # Q2 的默认路径：语义分区之后进行通信感知的列表调度。
     """Current complete strategy: semantic blocks followed by list scheduling."""
     from .semantic_partition import semantic_partition
 
@@ -430,6 +435,7 @@ def _schedule_partitions(
     num_cores: int,
     scenario: str = "q2",
 ) -> list[list[int]]:
+    # 用依赖就绪时间、计算结束时间和管线负载共同选择目标核。
     """Critical-path-first list schedule for identical cores."""
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
@@ -452,9 +458,20 @@ def _schedule_partitions(
     cross_core_wait = 1000
     core_pipe_load: list[dict[str, int]] = [dict() for _ in range(num_cores)]
     estimated_ddr_bytes = 0
+    cache_reuse = (
+        _partition_cache_reuse(partitions, features)
+        if scenario == "q3" and _q3_reuse_priority(features)
+        else {}
+    )
 
     while ready:
-        ready.sort(key=lambda pid: (-by_id[pid].rank_u, topo_position[pid]))
+        ready.sort(
+            key=lambda pid: (
+                -by_id[pid].rank_u,
+                -cache_reuse.get(pid, 0),
+                topo_position[pid],
+            )
+        )
         pid = ready.pop(0)
         partition = by_id[pid]
         best: tuple[float, float, float, int, int] | None = None
@@ -546,12 +563,18 @@ def _schedule_complex_partitions(
     core_pipe_load: list[dict[str, int]] = [dict() for _ in range(num_cores)]
     estimated_ddr_bytes = 0
     bandwidth = 60
+    cache_reuse = (
+        _partition_cache_reuse(partitions, features)
+        if scenario == "q3" and _q3_reuse_priority(features)
+        else {}
+    )
 
     while ready:
         ready.sort(
             key=lambda pid: (
                 pid not in critical_set,
                 critical_index.get(pid, len(critical_path)),
+                -cache_reuse.get(pid, 0),
                 -by_id[pid].rank_u,
                 topo_position[pid],
             )
@@ -686,11 +709,48 @@ def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, s
     )
 
 
+def _partition_cache_reuse(
+    partitions: list[Partition], features: GraphFeatures
+) -> dict[int, int]:
+    """Estimate Q3 reuse value from tensors consumed by multiple partitions."""
+    users: dict[int, set[int]] = {}
+    inputs: dict[int, set[int]] = {}
+    for partition in partitions:
+        tensor_ids = {
+            tensor_id
+            for op_id in partition.ops
+            for tensor_id in features.input_tensors.get(op_id, ())
+        }
+        inputs[partition.id] = tensor_ids
+        for tensor_id in tensor_ids:
+            users.setdefault(tensor_id, set()).add(partition.id)
+    return {
+        partition_id: sum(
+            int(features.tensor_by_id[tensor_id].get("size", 0))
+            * (len(users[tensor_id]) - 1)
+            for tensor_id in tensor_ids
+            if len(users[tensor_id]) > 1
+        )
+        for partition_id, tensor_ids in inputs.items()
+    }
+
+
+def _q3_reuse_priority(features: GraphFeatures) -> bool:
+    """Enable reuse ordering only for branch-heavy replicated motifs."""
+    from .graph_patterns import GraphPattern, classify_features
+
+    return classify_features(features).pattern in {
+        GraphPattern.CNN_RESIDUAL,
+        GraphPattern.GATED_SIGMOID_MLP,
+    }
+
+
 def build_algorithm_plan(
     features: GraphFeatures,
     num_cores: int = 4,
     scenario: str = "q2",
 ) -> AlgorithmResult:
+    # Q2 在本文件内完成图族识别、分区和调度，不调用其他题目的入口。
     """Build a plan with the complete strategy chosen by graph pattern."""
     from .graph_patterns import GraphPatternFamily, classify_features
 
@@ -744,6 +804,7 @@ def build_plan(
     num_cores: int = 4,
     features: GraphFeatures | None = None,
 ) -> AlgorithmResult:
+    # 对外统一入口：输入原始图，输出子图编号和每个核的执行顺序。
     """Build the Q2 plan using the current strategy implementation."""
     if features is None:
         features = analyze_graph(graph)
