@@ -136,12 +136,13 @@ def _wide_plan(
     from .graph_patterns import GraphPattern
     from .semantic_partition import semantic_partition
 
-    base = semantic_partition(features, max_ops=16, max_cycles=20000)
     operator_count = len(features.topo_order)
     if pattern == GraphPattern.WIDE_MATMUL_ADD:
-        # A long, moderately wide ADD spine needs smaller blocks so the
-        # scheduler can pipeline successive stages across cores.  Very wide
-        # shallow batches benefit from larger communication-saving blocks.
+        # MatMul-Add graphs are dominated by repeated compute/ADD tiles.  The
+        # old wide fallback left shallow cases at one semantic block per small
+        # tile, so Q2 paid a boundary transfer for work that Q1 kept local.
+        # Match Q1's bounded fusion policy, but retain the Q2 scheduler and
+        # its scene-B communication model below.
         layer_width = max(
             (
                 sum(features.depth[node] == level for node in features.topo_order)
@@ -149,37 +150,46 @@ def _wide_plan(
             ),
             default=0,
         )
-        if operator_count < 5000:
-            max_ops, max_cycles = 16, 20000
-            motif = "semantic_wide_fallback"
-        elif max(features.depth.values(), default=0) >= 16 and layer_width < 1000:
-            max_ops, max_cycles = 8, 6000
-            motif = "matmul_add_pipelined_spine"
-        else:
-            max_ops, max_cycles = 32, 18000
-            motif = "matmul_add_fan_in"
+        depth = max(features.depth.values(), default=0)
+        max_ops, max_cycles = (24, 32000) if layer_width < 1000 else (20, 24000)
+        if depth >= 16 and layer_width < 1000:
+            max_ops, max_cycles = 14, 14000
+        motif = "matmul_add_boundary_fusion"
+        base = semantic_partition(
+            features,
+            max_ops=max_ops,
+            max_cycles=max_cycles,
+            enable_singleton_repair=True,
+        )
+        partitions = _coalesce_topological_partitions(
+            base, min(max_ops, 32), min(max_cycles, 50000)
+        )
+        core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+        scheduler = "q2_affinity_list"
     elif pattern == GraphPattern.GATED_SIGMOID_MLP:
+        base = semantic_partition(features, max_ops=16, max_cycles=20000)
         max_ops, max_cycles = 24, 18000
         motif = "gated_chain"
     else:
+        base = semantic_partition(features, max_ops=16, max_cycles=20000)
         max_ops, max_cycles = 24, 16000
         motif = "compute_activation_branch"
     if pattern == GraphPattern.SHALLOW_WIDE_COMPUTE_ACTIVATION and operator_count < 5000:
+        base = semantic_partition(features, max_ops=16, max_cycles=20000)
         max_ops, max_cycles = 16, 20000
         motif = "semantic_wide_fallback"
-    if motif == "semantic_wide_fallback":
-        partitions = base
-    else:
-        partitions = _coalesce_topological_partitions(base, max_ops, max_cycles)
-    if motif == "matmul_add_pipelined_spine":
-        core_orders = _schedule_pipelined_topology(partitions, num_cores)
-        scheduler = "round_robin_spine_pipeline"
-    elif motif == "semantic_wide_fallback":
-        core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
-        scheduler = "communication_aware_list"
-    else:
-        core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
-        scheduler = "communication_aware_list"
+    if pattern != GraphPattern.WIDE_MATMUL_ADD:
+        if motif == "semantic_wide_fallback":
+            partitions = base
+        else:
+            partitions = _coalesce_topological_partitions(base, max_ops, max_cycles)
+    if pattern != GraphPattern.WIDE_MATMUL_ADD:
+        if motif == "semantic_wide_fallback":
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+            scheduler = "communication_aware_list"
+        else:
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+            scheduler = "communication_aware_list"
     return partitions, core_orders, {
         "strategy": "wide_communication_aware_coalescing",
         "scheduler": scheduler,

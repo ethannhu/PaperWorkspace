@@ -457,17 +457,27 @@ def main(argv: list[str] | None = None) -> int:
         default=list(QUESTIONS),
         help="要评测的问题；可单选或多选，例如 --q q1 q3",
     )
+    parser.add_argument(
+        "--experimental-search",
+        action="store_true",
+        help="Q1 使用官方 oracle 引导的种群搜索入口（实验性）",
+    )
     args = parser.parse_args(argv)
     if 1 not in args.cores:
         args.cores = [1, *args.cores]
 
     cores = tuple(sorted(set(args.cores)))
     questions = tuple(args.q)
+    algorithm_specs = dict(DEFAULT_ALGORITHMS)
+    if args.experimental_search:
+        if "q1" not in questions:
+            parser.error("--experimental-search requires --q q1")
+        algorithm_specs["q1"] = "subgraph.experimental_search:build_plan"
     output_dir = args.output_dir or Path("results/multicore_cases")
     graph_paths = discover_cases(args.cases_dir)
     batch = evaluate_cases(
         graph_paths,
-        DEFAULT_ALGORITHMS,
+        algorithm_specs,
         output_dir,
         cores,
         questions,

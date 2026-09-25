@@ -44,7 +44,7 @@ class WideAlgorithmTests(unittest.TestCase):
         )
         result = build_plan(graph, num_cores=4)
         algorithm = result.diagnostics["algorithm"]
-        self.assertEqual(algorithm["motif"], "matmul_add_fan_in")
+        self.assertEqual(algorithm["motif"], "matmul_add_boundary_fusion")
         self.assertLess(algorithm["partition_count"], algorithm["base_partition_count"])
         self.assertLessEqual(algorithm["max_ops"], 32)
 
