@@ -16,7 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from .demo_algorithm import GraphFeatures, analyze_graph
+from .algorithm_common import GraphFeatures, analyze_graph
 
 
 class GraphPattern(StrEnum):

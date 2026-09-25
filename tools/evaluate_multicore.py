@@ -87,7 +87,7 @@ def _prepare_reusable_context(
     parameters = inspect.signature(algorithm).parameters
     if "features" not in parameters:
         return {}
-    from subgraph.demo_algorithm import analyze_graph
+    from subgraph.algorithm_common import analyze_graph
 
     return {"features": analyze_graph(graph)}
 

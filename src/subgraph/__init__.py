@@ -1,6 +1,6 @@
 """Public graph-analysis and algorithm entry points."""
 
-from .demo_algorithm import analyze_graph, classify_op, describe_graph_pattern
+from .algorithm_common import analyze_graph, classify_op, describe_graph_pattern
 from .graph_patterns import (
     GraphPattern,
     GraphPatternFamily,
