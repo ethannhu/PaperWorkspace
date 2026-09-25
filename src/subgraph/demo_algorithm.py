@@ -233,6 +233,161 @@ def _semantic_plan(
     }
 
 
+def _coalesce_topological_partitions(
+    partitions: list[Partition],
+    max_ops: int,
+    max_cycles: int,
+) -> list[Partition]:
+    """Merge adjacent partition-DAG blocks without crossing topological order.
+
+    The semantic merger deliberately refuses many fan-in/fan-out joins.  That
+    is useful for ordinary graphs, but it leaves wide replicated graphs with
+    one block per operator.  Consecutive blocks in a topological order can be
+    coalesced safely: every edge between the resulting intervals still points
+    forward, so the quotient graph remains acyclic.  The size limits preserve
+    enough intra-core parallelism and keep live memory pressure bounded.
+    """
+    if not partitions:
+        return []
+    topo = _partition_topology(partitions)
+    by_id = {partition.id: partition for partition in partitions}
+    groups: list[list[Partition]] = []
+    current: list[Partition] = []
+    current_ops = 0
+    current_cycles = 0
+    for pid in topo:
+        partition = by_id[pid]
+        too_large = current and (
+            current_ops + len(partition.ops) > max_ops
+            or current_cycles + partition.cycles > max_cycles
+        )
+        if too_large:
+            groups.append(current)
+            current = []
+            current_ops = 0
+            current_cycles = 0
+        current.append(partition)
+        current_ops += len(partition.ops)
+        current_cycles += partition.cycles
+    if current:
+        groups.append(current)
+
+    owner = {
+        partition.id: group_id
+        for group_id, group in enumerate(groups)
+        for partition in group
+    }
+    merged: list[Partition] = []
+    for group_id, group in enumerate(groups):
+        ops = [op_id for partition in group for op_id in partition.ops]
+        pipe_cycles: dict[str, int] = {}
+        for partition in group:
+            for pipe, cycles in partition.pipe_cycles.items():
+                pipe_cycles[pipe] = pipe_cycles.get(pipe, 0) + cycles
+        merged.append(
+            Partition(
+                id=group_id,
+                ops=ops,
+                cycles=sum(partition.cycles for partition in group),
+                rank_u=max(partition.rank_u for partition in group),
+                pipe_cycles=pipe_cycles,
+            )
+        )
+    for partition in partitions:
+        source_group = owner[partition.id]
+        for successor in partition.succs:
+            target_group = owner[successor]
+            if source_group == target_group:
+                continue
+            merged[source_group].succs.add(target_group)
+            merged[target_group].preds.add(source_group)
+    return merged
+
+
+def _schedule_pipelined_topology(
+    partitions: list[Partition],
+    num_cores: int,
+) -> list[list[int]]:
+    """Spread a narrow dependency spine so successive blocks can overlap."""
+    if num_cores < 1:
+        raise ValueError("num_cores must be positive")
+    orders = [[] for _ in range(num_cores)]
+    for index, pid in enumerate(_partition_topology(partitions)):
+        orders[index % num_cores].append(pid)
+    return orders
+
+
+def _wide_plan(
+    features: GraphFeatures,
+    num_cores: int,
+    scenario: str,
+    pattern: Any,
+) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
+    """Communication-aware strategy for wide replicated computation graphs.
+
+    WIDE graphs expose abundant parallelism, but fan-in/fan-out prevents the
+    strict semantic pass from fusing enough operators.  Coalesce its blocks in
+    topological intervals, keeping compute/activation or gate stages local
+    while preventing a single partition from becoming too large.
+    """
+    from .graph_patterns import GraphPattern
+    from .semantic_partition import semantic_partition
+
+    base = semantic_partition(features, max_ops=16, max_cycles=20000)
+    operator_count = len(features.topo_order)
+    if pattern == GraphPattern.WIDE_MATMUL_ADD:
+        # A long, moderately wide ADD spine needs smaller blocks so the
+        # scheduler can pipeline successive stages across cores.  Very wide
+        # shallow batches benefit from larger communication-saving blocks.
+        layer_width = max(
+            (
+                sum(features.depth[node] == level for node in features.topo_order)
+                for level in set(features.depth.values())
+            ),
+            default=0,
+        )
+        if operator_count < 5000:
+            max_ops, max_cycles = 16, 20000
+            motif = "semantic_wide_fallback"
+        elif max(features.depth.values(), default=0) >= 16 and layer_width < 1000:
+            max_ops, max_cycles = 8, 6000
+            motif = "matmul_add_pipelined_spine"
+        else:
+            max_ops, max_cycles = 32, 18000
+            motif = "matmul_add_fan_in"
+    elif pattern == GraphPattern.GATED_SIGMOID_MLP:
+        max_ops, max_cycles = 24, 18000
+        motif = "gated_chain"
+    else:
+        max_ops, max_cycles = 24, 16000
+        motif = "compute_activation_branch"
+    if pattern == GraphPattern.SHALLOW_WIDE_COMPUTE_ACTIVATION and operator_count < 5000:
+        max_ops, max_cycles = 16, 20000
+        motif = "semantic_wide_fallback"
+    if motif == "semantic_wide_fallback":
+        partitions = base
+    else:
+        partitions = _coalesce_topological_partitions(base, max_ops, max_cycles)
+    if motif == "matmul_add_pipelined_spine":
+        core_orders = _schedule_pipelined_topology(partitions, num_cores)
+        scheduler = "round_robin_spine_pipeline"
+    elif motif == "semantic_wide_fallback":
+        core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+        scheduler = "communication_aware_list"
+    else:
+        core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+        scheduler = "communication_aware_list"
+    return partitions, core_orders, {
+        "strategy": "wide_communication_aware_coalescing",
+        "scheduler": scheduler,
+        "motif": motif,
+        "base_partition_count": len(base),
+        "partition_count": len(partitions),
+        "max_ops": max_ops,
+        "max_cycles": max_cycles,
+    }
+
+
 def _complex_plan(
     features: GraphFeatures,
     num_cores: int,
@@ -742,7 +897,14 @@ def build_algorithm_plan(
     from .graph_patterns import GraphPatternFamily, classify_features
 
     graph_pattern = classify_features(features)
-    if graph_pattern.family == GraphPatternFamily.COMPLEX:
+    if graph_pattern.family == GraphPatternFamily.WIDE:
+        partitions, core_orders, strategy_diagnostics = _wide_plan(
+            features,
+            num_cores,
+            scenario,
+            graph_pattern.pattern,
+        )
+    elif graph_pattern.family == GraphPatternFamily.COMPLEX:
         partitions, core_orders, strategy_diagnostics = _complex_plan(
             features,
             num_cores,
