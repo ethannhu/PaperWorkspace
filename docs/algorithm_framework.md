@@ -20,9 +20,22 @@ diagnostics = result.diagnostics
 
 Scheduling is not a replaceable framework stage.  It is part of the selected
 strategy because placement choices depend on how that strategy formed
-partitions.  The current four family branches all call the same semantic
-strategy internally; later work should replace a whole family strategy rather
-than mixing an unrelated partitioner with an unrelated scheduler.
+partitions.  New work should replace a whole family strategy rather than
+mixing an unrelated partitioner with an unrelated scheduler.
+
+The complex family is the first specialized branch.  It targets
+CNN/Residual and Attention/Normalize graphs by combining semantic operator
+fusion with critical-path protection:
+
+- run semantic partitioning with singleton repair and slightly larger block
+  limits, so isolated residual or normalize-chain operators are not left as
+  unnecessary one-op tasks;
+- find the heaviest critical path in the partition DAG;
+- schedule most complex graphs with a sticky critical spine, keeping the
+  protected path and expensive joins on the predecessor core when that avoids
+  costly cross-core traffic;
+- for very long CNN residual spines, keep the complex fusion but fall back to
+  plain list scheduling to preserve convolution-level parallelism.
 
 The command-line entry point mirrors the same simple path:
 

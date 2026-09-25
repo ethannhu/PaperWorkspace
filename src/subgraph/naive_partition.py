@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .demo_framework import GraphFeatures, Partition
+    from .demo_algorithm import GraphFeatures, Partition
 
 
 def naive_partition(
@@ -24,8 +24,8 @@ def naive_partition(
         raise ValueError("partition limits must be positive")
 
     # Import lazily so importing the selectable module does not introduce a
-    # cycle while demo_framework dispatches to this implementation.
-    from .demo_framework import Partition
+    # cycle while demo_algorithm dispatches to this implementation.
+    from .demo_algorithm import Partition
 
     partitions: list[Partition] = []
     op_to_partition: dict[int, int] = {}

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .demo_framework import GraphFeatures, Partition
+    from .demo_algorithm import GraphFeatures, Partition
 
 
 COMPUTE_ROLES = {"DENSE_COMPUTE", "COMPUTE"}
@@ -543,7 +543,7 @@ def _merge_blocks(
 
 def build_partition_dag(features: GraphFeatures, blocks: dict[int, SemanticBlock]) -> list[Partition]:
     """Convert semantic blocks into compact partition objects."""
-    from .demo_framework import Partition
+    from .demo_algorithm import Partition
 
     ordered = sorted(blocks.values(), key=lambda block: (min(block.nodes), block.id))
     remap = {block.id: index for index, block in enumerate(ordered)}
