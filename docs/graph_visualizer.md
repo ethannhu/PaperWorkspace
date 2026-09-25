@@ -7,13 +7,13 @@
 在仓库根目录执行：
 
 ```bash
-uv run python tools/graph_visualizer.py
+python3 tools/graph_visualizer.py
 ```
 
 默认访问 <http://127.0.0.1:8765>。如果当前环境不能自动打开浏览器，可使用：
 
 ```bash
-uv run python tools/graph_visualizer.py --no-browser
+python3 tools/graph_visualizer.py --no-browser
 ```
 
 ## 交互说明

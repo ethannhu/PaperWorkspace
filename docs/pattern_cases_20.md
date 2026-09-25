@@ -35,4 +35,4 @@
 | 极窄超深 Reduce-Relu-Add | case_016, case_024 |
 | 极宽 MatMul-Add 批处理 | case_011, case_058 |
 
-清单文件为 `data/pattern_cases_20.txt`，benchmark 会从原始 `data` 目录读取这些 case，不复制原始 JSON。
+本清单只记录代表性样例；实际 JSON 位于 `artifacts/data/` 和 `artifacts/excases/`，仓库当前没有单独的 `pattern_cases_20.txt` 文件。

@@ -1,7 +1,7 @@
 # Demo 算法统一设计
 
-本文是 `docs/demo_model.md`、`docs/demo_solution.md` 和
-`docs/demo_code_arch.md` 的整合版。它定义 demo 算法的统一术语、三道题的
+本文是本目录中 `demo_model.md`、`demo_solution.md` 和
+`demo_code_arch.md` 的整合版。它定义 demo 算法的统一术语、三道题的
 约束差异、算法流程和可实现的输出边界；其他文档分别保留模型推导、方案讨论
 和工程细节，不再另行定义题目规则。
 
