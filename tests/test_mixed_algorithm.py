@@ -47,8 +47,9 @@ class MixedAlgorithmTests(unittest.TestCase):
         )
         self.assertEqual(
             [len(schedule) for schedule in plan["core_schedules"]],
-            [150, 150, 150, 100],
+            [300, 250, 0, 0],
         )
+        self.assertEqual(algorithm["effective_core_count"], 2)
 
 
 if __name__ == "__main__":

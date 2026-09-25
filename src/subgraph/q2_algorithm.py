@@ -249,9 +249,17 @@ def _complex_plan(
         or pattern == GraphPattern.CNN_RESIDUAL and critical_cycles > 50000
     ):
         if replicated_narrow_cnn:
-            core_orders = _schedule_replicated_components(
-                partitions, num_cores
+            # Tiny replicated chains are transfer-bound: case_044 has eleven
+            # 7,672-cycle chains, and spreading them past two cores makes the
+            # extra COPY_IN traffic exceed the compute saved.  Larger replicas
+            # (for example case_046 and case_078) retain the full core count.
+            effective_cores = (
+                min(num_cores, 2) if critical_cycles <= 10000 else num_cores
             )
+            core_orders = _schedule_replicated_components(
+                partitions, effective_cores
+            )
+            core_orders.extend([[] for _ in range(num_cores - effective_cores)])
             scheduler = "balanced_replicated_component_list"
         else:
             core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
@@ -273,6 +281,11 @@ def _complex_plan(
         "critical_path_cycles": critical_cycles,
         "max_layer_width": layer_width,
         "replicated_narrow_cnn": replicated_narrow_cnn,
+        "effective_core_count": (
+            min(num_cores, 2)
+            if replicated_narrow_cnn and critical_cycles <= 10000
+            else num_cores
+        ),
     }
 
 
@@ -792,9 +805,18 @@ def build_algorithm_plan(
             num_cores,
             scenario,
         )
-    core_orders, rebalance_diagnostics = rebalance_core_orders(
-        partitions, features, core_orders, scenario
-    )
+    if strategy_diagnostics.get("effective_core_count", num_cores) < num_cores:
+        # The short-replica guard deliberately leaves trailing cores idle;
+        # global migration must not repopulate them with tiny partitions.
+        rebalance_diagnostics = {
+            "enabled": False,
+            "reason": "short_replicated_chain_core_cap",
+            "moves": 0,
+        }
+    else:
+        core_orders, rebalance_diagnostics = rebalance_core_orders(
+            partitions, features, core_orders, scenario
+        )
     strategy_diagnostics["global_rebalance"] = rebalance_diagnostics
     node_to_subgraph = {
         str(op_id): partition.id
