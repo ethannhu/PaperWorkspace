@@ -1,7 +1,22 @@
+# ============================================================
+# 人工智能工具信息 | AI Tool Information
+#   工具名称 (Tool Name)        : GLM-5.2
+#   版本/型号 (Version/Model)   : GLM-5.2
+#   开发机构/公司 (Developer)    : 智谱AI (Zhipu AI / zai-org)
+#   版本颁布日期 (Release Date) : 2026-06-13
+#   声明：本程序及代码是在人工智能工具辅助下完成的
+# ============================================================
 """从原始计算图中提取算子语义特征。
 
 这个文件只负责“看懂图”，不负责生成最终的切图方案或 Core 调度方案。
 后续的 partition、buffer 构造和调度算法可以直接读取本文件生成的 JSON。
+
+输出结构（schema_version = "semantic-features-v1"）：
+    * graph: 算子/张量/边总数 + 拓扑序 + role/family/pipe 统计 + 候选边统计；
+    * operators: 每个算子的 role/family/resource/pipe/cycles/fan_in/fan_out/
+      dependency_depth 等可读特征；
+    * semantic_edges: 每条 COPY 收缩后的 candidate 依赖边的 fusion_score 与
+      可解释 reason 列表。
 """
 
 from __future__ import annotations
@@ -24,6 +39,11 @@ def _role(op_name: str, pipe: str) -> tuple[str, str, str]:
 
     这里不尝试推断完整的数学算子，只使用题目数据中稳定存在的 op/pipe
     字段。标签足够支持第一版的融合和切分启发式。
+
+    返回 (role, family, resource)：
+        * role     —— compute/elementwise/reduction/communication 五大类之一；
+        * family   —— 输出更细的算子名（matmul/convolution/...），用于诊断；
+        * resource —— MATRIX/VECTOR/DMA 三种之一，与硬件资源族对齐。
     """
     if op_name in COPY_OPS:
         return "communication", "copy", "DMA"
@@ -36,16 +56,22 @@ def _role(op_name: str, pipe: str) -> tuple[str, str, str]:
     if op_name in ELEMENTWISE_OPS:
         return "elementwise", "elementwise", "VECTOR"
     if pipe == "PIPE_M":
+        # 没有 op 名时退化到 pipe 启发：PIPE_M 多为矩阵类。
         return "compute", "generic_compute", "MATRIX"
     if pipe == "PIPE_V":
         return "elementwise", "generic_vector", "VECTOR"
     if pipe in {"PIPE_MTE2", "PIPE_MTE3"}:
+        # MTE 是 memory transfer engine，归为通信类。
         return "communication", "memory", "DMA"
     return "compute", "unknown", "UNKNOWN"
 
 
 def _graph_views(graph: dict[str, Any]) -> tuple[dict[int, dict], dict[int, dict], dict[int, set[int]], dict[int, set[int]]]:
-    """构造算子、张量以及算子级依赖关系。"""
+    """构造算子、张量以及算子级依赖关系。
+
+    额外把“op→tensor→op”二跳路径直接连成 op→op 边，这样后续拓扑排序与
+    COPY 收缩可以直接基于算子图进行。
+    """
     ops = {int(item["id"]): item for item in graph.get("ops", [])}
     tensors = {int(item["id"]): item for item in graph.get("tensors", [])}
     preds = {op_id: set() for op_id in ops}
@@ -63,6 +89,7 @@ def _graph_views(graph: dict[str, Any]) -> tuple[dict[int, dict], dict[int, dict
         elif source in tensors and target in ops:
             consumers[source].add(target)
 
+    # 把 tensor 中转依赖桥接成直接的 op→op 边。
     for tensor_id, source_ids in producers.items():
         for source in source_ids:
             for target in consumers.get(tensor_id, ()):
@@ -73,9 +100,13 @@ def _graph_views(graph: dict[str, Any]) -> tuple[dict[int, dict], dict[int, dict
 
 
 def _topological_depth(op_ids: list[int], preds: dict[int, set[int]], succs: dict[int, set[int]]) -> tuple[list[int], dict[int, int]]:
-    """计算拓扑序和从输入开始的依赖深度。"""
+    """计算拓扑序和从输入开始的依赖深度。
+
+    依赖深度即节点在 DAG 中的最长前驱链长度：root = 0，其余 = max(前驱) + 1。
+    """
     indegree = {op_id: len(preds[op_id]) for op_id in op_ids}
     depth = {op_id: 0 for op_id in op_ids}
+    # 就绪队列用 deque + sorted，保证同一层按 op_id 升序处理，结果稳定。
     ready = deque(sorted(op_id for op_id in op_ids if indegree[op_id] == 0))
     order: list[int] = []
     while ready:
@@ -93,7 +124,12 @@ def _topological_depth(op_ids: list[int], preds: dict[int, set[int]], succs: dic
 
 
 def _contract_copy_edges(ops: dict[int, dict], succs: dict[int, set[int]]) -> dict[int, set[int]]:
-    """跳过 COPY 节点，生成非 COPY 算子之间的候选融合边。"""
+    """跳过 COPY 节点，生成非 COPY 算子之间的候选融合边。
+
+    对每个非 COPY 算子做 BFS：沿 succs 向下走，跳过 COPY 后落到下一个非
+    COPY 节点，记录为一条 candidate 融合边。这等价于评测器把 COPY 看作
+    边界后用户方案的“跨分区依赖”集合。
+    """
     eligible = {op_id for op_id, op in ops.items() if op.get("op") not in COPY_OPS}
     contracted = {op_id: set() for op_id in eligible}
     for source in sorted(eligible):
@@ -112,7 +148,19 @@ def _contract_copy_edges(ops: dict[int, dict], succs: dict[int, set[int]]) -> di
 
 
 def _fusion_score(source: dict, target: dict) -> tuple[float, list[str]]:
-    """给一条候选依赖边打简单、可解释的融合分。"""
+    """给一条候选依赖边打简单、可解释的融合分。
+
+    打分规则（每条记录一条 reason）：
+        * elementwise→elementwise                 +4.0；连续逐元素；
+        * compute→elementwise/reduction           +4.0；计算后轻量后处理；
+        * reduction→elementwise                   +3.0；归约后逐元素；
+        * 同角色                                   +2.0；
+        * 同 resource（非 UNKNOWN）                +1.0；可避免资源切换；
+        * source fan_out > 1                      -2.0；保留分支；
+        * target fan_in > 1                       -1.0；避免汇聚串行；
+        * matmul→matmul                           -1.0；连续矩阵更适合并行。
+    最终阈值 ≥4.0 → fuse，否则 cut。
+    """
     source_role, source_family = source["role"], source["family"]
     target_role, target_family = target["role"], target["family"]
     score = 0.0
@@ -147,9 +195,15 @@ def _fusion_score(source: dict, target: dict) -> tuple[float, list[str]]:
 
 
 def analyze_graph(graph: dict[str, Any], source: str | None = None) -> dict[str, Any]:
-    """提取一张计算图的语义特征和可解释的融合边评分。"""
+    """提取一张计算图的语义特征和可解释的融合边评分。
+
+    返回结构详见模块 docstring。``source`` 仅写到 ``source`` 字段，方便后续
+    JSON 报告溯源。
+    """
     ops, tensors, preds, succs = _graph_views(graph)
     order, depth = _topological_depth(sorted(ops), preds, succs)
+    # 同时整理 tensor→op 关系，方便下面给每个 op 算 input_tensors /
+    # output_tensors 与字节数。
     tensor_inputs: dict[int, list[int]] = defaultdict(list)
     tensor_outputs: dict[int, list[int]] = defaultdict(list)
     for edge in graph.get("edges", []):
@@ -192,11 +246,14 @@ def analyze_graph(graph: dict[str, Any], source: str | None = None) -> dict[str,
             "dependency_depth": depth[op_id],
             "is_branch": fan_out > 1,
             "is_join": fan_in > 1,
+            # parallelism_hint 给上层可视化用：直观显示该算子处于 branch/join
+            # 还是 chain 形态。
             "parallelism_hint": "branch" if fan_out > 1 else "join" if fan_in > 1 else "chain",
         }
 
     contracted = _contract_copy_edges(ops, succs)
     semantic_edges: list[dict[str, Any]] = []
+    # 对每条 COPY 收缩后的候选边打分，把评分、理由、decision 与通信字节都记下。
     for source_id in sorted(contracted):
         for target_id in sorted(contracted[source_id]):
             score, reasons = _fusion_score(features[source_id], features[target_id])
@@ -233,6 +290,7 @@ def analyze_graph(graph: dict[str, Any], source: str | None = None) -> dict[str,
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口：读取图 → 输出语义特征 JSON。"""
     parser = argparse.ArgumentParser(description="提取计算图中的算子语义特征")
     parser.add_argument("graph", type=Path, help="输入计算图 JSON")
     parser.add_argument("-o", "--output", type=Path, help="输出语义特征 JSON")

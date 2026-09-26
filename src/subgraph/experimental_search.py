@@ -1,13 +1,19 @@
-"""Experimental oracle-guided population search for Q1.
+# ============================================================
+# 人工智能工具信息 | AI Tool Information
+#   工具名称 (Tool Name)        : GLM-5.2
+#   版本/型号 (Version/Model)   : GLM-5.2
+#   开发机构/公司 (Developer)    : 智谱AI (Zhipu AI / zai-org)
+#   版本颁布日期 (Release Date) : 2026-06-13
+#   声明：本程序及代码是在人工智能工具辅助下完成的
+# ============================================================
+"""Q1 实验性 oracle 引导的种群搜索。
 
-This module is deliberately separate from :mod:`q1_algorithm`.  It reuses
-Q1's legal partitioning, then searches only the assignment of those
-partitions to cores.  Candidate fitness is measured by the official Q1
-evaluator, not by a proxy model.  The normal Q1 entry point is untouched.
+本模块刻意与 :mod:`q1_algorithm` 分开。它复用 Q1 的合法分区，只搜索“分区到
+核”的分配，候选方案的适应度用官方 Q1 评测器（而非代理模型）测得。常规 Q1
+入口保持不变。
 
-The search is intentionally small and deterministic.  It is useful for
-experiments and regression comparisons, while the production algorithm keeps
-its predictable runtime.
+搜索刻意保持小规模且确定。它适合做实验和回归对比，不会影响生产算法的可预
+测运行时。
 """
 
 from __future__ import annotations
@@ -27,6 +33,11 @@ from .q1_algorithm import build_plan as build_q1_plan
 
 
 def _int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    """从环境变量读取整数，超界则夹到 [minimum, maximum]。
+
+    所有搜索超参数都通过 ``_int_env`` 暴露，便于离线实验时按 case 调整，而
+    不需要修改源码。``default`` 同时是回归测试使用的固定值。
+    """
     try:
         value = int(os.environ.get(name, default))
     except ValueError:
@@ -35,7 +46,7 @@ def _int_env(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def _official_evaluate(graph: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate one candidate through the checked-in official simulator."""
+    """用仓库内置的官方 Q1 评测器评估单个候选方案。"""
     repo_root = Path(__file__).resolve().parents[2]
     evaluator = repo_root / "artifacts" / "code" / "multicore_cut_evaluate_problem_1.py"
     config = Path(os.environ.get("SUBGRAPH_SEARCH_CONFIG", ""))
@@ -43,9 +54,8 @@ def _official_evaluate(graph: dict[str, Any], plan: dict[str, Any]) -> dict[str,
         config = repo_root / "artifacts" / "excases" / "config.txt"
     timeout = _int_env("SUBGRAPH_SEARCH_ORACLE_TIMEOUT", 120, 1, 600)
 
-    # The execution environment may have a small, shared /tmp tmpfs.  Keep
-    # oracle scratch files beside the repository instead; TemporaryDirectory
-    # still removes every candidate's files immediately after evaluation.
+    # 执行环境的 /tmp 可能是空间受限的 tmpfs。把 oracle 临时文件放到仓库旁边；
+    # TemporaryDirectory 仍会在评估完成后立刻清理每个候选的文件。
     scratch_root = repo_root / ".oracle-tmp"
     scratch_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="subgraph-oracle-", dir=scratch_root) as directory:
@@ -84,6 +94,10 @@ def _candidate_plan(
     topo_rank: dict[int, int],
     num_cores: int,
 ) -> dict[str, Any]:
+    """把一个“分区→核”分配转换成可送评测器的方案 JSON。
+
+    核内顺序按 ``topo_rank`` 排序，确保同核内不会出现后继在前驱之前的情况。
+    """
     by_core: list[list[int]] = [[] for _ in range(num_cores)]
     for subgraph_id, core in enumerate(assignment):
         by_core[core].append(subgraph_id)
@@ -100,11 +114,11 @@ def _partition_topological_rank(
     node_to_subgraph: dict[str, Any],
     subgraph_ids: list[int],
 ) -> dict[int, int]:
-    """Return a true topological order of the partition DAG.
+    """返回分区 DAG 的真实拓扑序对应的位次。
 
-    A partition can contain non-contiguous operation positions.  Ordering
-    partitions by their first operation therefore can reverse a later
-    cross-partition edge and produce an invalid same-core Task order.
+    一个分区可能包含拓扑上不连续的多个算子位置。如果按“分区内第一个算子
+    出现的顺序”对分区编号，可能把一条靠后的跨分区边反向，从而产生非法的同
+    核 Task 顺序。因此这里跑一次真正的分区拓扑排序作为一个安全网。
     """
     node_owner = {int(node_id): int(partition_id)
                   for node_id, partition_id in node_to_subgraph.items()}
@@ -118,6 +132,8 @@ def _partition_topological_rank(
                 successors[source_partition].add(target_partition)
                 predecessors[target_partition].add(source_partition)
 
+    # “最早出现位置”作为拓扑排序的同秩 tie-break：保证在不引入环的前提下，
+    # 分区序尽量贴合用户原始的算子序。
     topo_position = {
         node_id: index for index, node_id in enumerate(features.topo_order)
     }
@@ -151,6 +167,7 @@ def _partition_topological_rank(
 
 
 def _score(result: dict[str, Any]) -> tuple[float, float]:
+    """从 oracle 结果中提取目标：先比 makespan，平手再比 cross-task 字节数。"""
     makespan = float(result.get("makespan", float("inf")))
     movement = result.get("data_movement_bytes", float("inf"))
     if isinstance(movement, dict):
@@ -165,7 +182,16 @@ def build_plan(
     num_cores: int = 4,
     features: GraphFeatures | None = None,
 ) -> AlgorithmResult:
-    """Build a Q1 plan with a small official-oracle evolutionary search."""
+    """用小规模“官方 oracle 引导”的演化搜索构建 Q1 方案。
+
+    搜索流程：
+        1. 跑一次 Q1 基线，得到分区 + 初始分配；
+        2. 计算分区 DAG 的真实拓扑序，作为同核内顺序的安全网；
+        3. 用固定种子的 RNG 生成初始化种群（含基线个体 + 多个抖动个体）；
+        4. 迭代 ``generations`` 轮：精英选择 → 均匀交叉 → 单点变异；
+        5. 输出适应度最高的方案，并把搜索元数据写到 diagnostics。
+    整个过程对 ``num_cores`` 和节点数确定性，便于回归复现。
+    """
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
     if features is None:
@@ -182,17 +208,22 @@ def build_plan(
     topo_rank = _partition_topological_rank(
         features, node_to_subgraph, subgraph_ids
     )
+    # 把基线方案还原成一个 assignment tuple：每个分区在哪个核。
     baseline_assignment = [0] * len(subgraph_ids)
     for core, schedule in enumerate(baseline.plan["core_schedules"]):
         for subgraph_id in schedule:
             baseline_assignment[int(subgraph_id)] = core
     baseline_tuple = tuple(baseline_assignment)
 
+    # 种群规模与代数都通过环境变量夹到合理区间：太小 (2,1) 没有搜索能力，
+    # 太大 (32,20) 会让 oracle 调用成本失控。
     population_size = _int_env("SUBGRAPH_SEARCH_POPULATION", 8, 2, 32)
     generations = _int_env("SUBGRAPH_SEARCH_GENERATIONS", 3, 1, 20)
+    # 种子固定且依赖 (num_cores, 节点数)，保证同一张图可复现。
     seed = 1729 + 31 * num_cores + len(features.topo_order)
     rng = random.Random(seed)
     population: list[tuple[int, ...]] = [baseline_tuple]
+    # 基线之外的初始个体：随机改动 1~4 个分区所属核，对基线做局部抖动。
     for _ in range(population_size - 1):
         individual = list(baseline_tuple)
         moves = 1 + rng.randrange(max(1, min(4, len(individual))))
@@ -213,9 +244,11 @@ def build_plan(
         return cache[individual][0]
 
     for _ in range(generations):
+        # 1) 精英：取前 1/4 直接保留，确保每代都不退化。
         ranked = sorted(population, key=evaluate)
         elites = ranked[: max(1, population_size // 4)]
         next_population = list(elites)
+        # 2) 繁殖：父本从精英中选，母本从前一半中选，单点交叉后 0.8 概率变异。
         while len(next_population) < population_size:
             left = rng.choice(elites)
             right = rng.choice(ranked[: max(2, population_size // 2)])

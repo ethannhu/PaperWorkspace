@@ -1,3 +1,11 @@
+# ============================================================
+# 人工智能工具信息 | AI Tool Information
+#   工具名称 (Tool Name)        : GLM-5.2
+#   版本/型号 (Version/Model)   : GLM-5.2
+#   开发机构/公司 (Developer)    : 智谱AI (Zhipu AI / zai-org)
+#   版本颁布日期 (Release Date) : 2026-06-13
+#   声明：本程序及代码是在人工智能工具辅助下完成的
+# ============================================================
 """多核切图算法空模板。
 
 这个脚本只负责生成一份格式合法的最小方案：
@@ -47,6 +55,8 @@ def build_empty_plan(graph: dict[str, Any], num_cores: int) -> dict[str, Any]:
         raise ValueError("num_cores must be at least 1")
 
     excluded_copy_types, _ = _load_stub_helpers()
+    # COPY 类算子由评测器自动补充，不需要也不允许在用户方案中预先指定，
+    # 因此这里过滤掉题目列入 EXCLUDED_COPY_TYPES 的算子。
     eligible_ops = sorted(
         op["id"]
         for op in graph.get("ops", [])
@@ -55,6 +65,7 @@ def build_empty_plan(graph: dict[str, Any], num_cores: int) -> dict[str, Any]:
 
     # JSON 对象的键最终会被写成字符串；评估器同时接受数字字符串。
     node_to_subgraph = {str(op_id): 0 for op_id in eligible_ops}
+    # 第 0 个核执行唯一子图 0；其余核保持空列表，作为合法但无效的占位。
     core_schedules = [[0]] + [[] for _ in range(num_cores - 1)]
 
     return {
@@ -64,6 +75,7 @@ def build_empty_plan(graph: dict[str, Any], num_cores: int) -> dict[str, Any]:
 
 
 def load_graph(path: Path) -> dict[str, Any]:
+    """从 JSON 文件加载原始计算图。"""
     with path.open("r", encoding="utf-8") as stream:
         graph = json.load(stream)
     if not isinstance(graph, dict):
@@ -72,6 +84,7 @@ def load_graph(path: Path) -> dict[str, Any]:
 
 
 def write_plan(path: Path, plan: dict[str, Any]) -> None:
+    """把方案 JSON 写入磁盘，确保父目录存在并以换行结尾。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
         json.dump(plan, stream, ensure_ascii=False, indent=2)
@@ -79,6 +92,7 @@ def write_plan(path: Path, plan: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """命令行入口：读图 → 生成空方案 → 校验 → 落盘。"""
     parser = argparse.ArgumentParser(description="生成多核切图算法空模板方案")
     parser.add_argument("graph", type=Path, help="输入计算图 JSON")
     parser.add_argument(

@@ -1,16 +1,24 @@
-"""Batch-evaluate the official random multicore stub on contest cases.
+# ============================================================
+# 人工智能工具信息 | AI Tool Information
+#   工具名称 (Tool Name)        : GLM-5.2
+#   版本/型号 (Version/Model)   : GLM-5.2
+#   开发机构/公司 (Developer)    : 智谱AI (Zhipu AI / zai-org)
+#   版本颁布日期 (Release Date) : 2026-06-13
+#   声明：本程序及代码是在人工智能工具辅助下完成的
+# ============================================================
+"""在比赛 case 上批量评估官方随机多核 stub。
 
-For every ``case_<number>.json``, this runner first invokes
-``artifacts/code/stub_multicore_cut_and_schedule.py`` to generate a plan and
-then runs the requested official problem evaluators.  All generated files are
-kept below one directory per case, so the original ``artifacts/data`` inputs
-are never modified.
+对每个 ``case_<number>.json``，先调用
+``artifacts/code/stub_multicore_cut_and_schedule.py`` 生成一份 stub 方案，然后
+再对每个 (case, core, question) 跑官方评测器。所有产物都落在每 case 一个目
+录下，不会修改 ``artifacts/data`` 中的输入。
 
-Example::
-
+示例：
     uv run tools/evaluate_stub_multicore.py
 
-By default this evaluates all 100 cases, Q1--Q3, and one to five cores.
+默认会跑全部 100 个 case、Q1--Q3、1--5 核。可通过环境变量 ``WORKERS`` 控制
+评测器的并发数；stub 方案的生成会先用一个线程池跑完，再启动评测器并发，这
+样即便某次评测失败，所有输入方案都已落盘可供排查。
 """
 
 from __future__ import annotations
@@ -25,9 +33,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+# tqdm 不可用时退化为简单的计数式进度条，保持脚本可独立运行。
 try:
     from tqdm import tqdm
-except ImportError:  # Keep this standalone runner usable with plain Python.
+except ImportError:  # tqdm 缺失时让脚本仍可用纯 Python 跑。
     class _Progress:
         def __init__(self, total: int, **_: Any) -> None:
             self.total = total
@@ -46,14 +55,18 @@ except ImportError:  # Keep this standalone runner usable with plain Python.
 
 QUESTIONS = ("q1", "q2", "q3")
 CORE_COUNTS = (1, 2, 3, 4, 5)
-# Set WORKERS=8 (for example) before running the script to control evaluator
-# parallelism.  Stub planning completes before evaluator workers start.
+# 可在运行前用 export WORKERS=8 控制评测器并发。stub 生成阶段先用线程池跑完，
+# 评测阶段再开 WORKERS 个并发。
 WORKERS = int(os.environ.get("WORKERS", "4"))
 DEFAULT_TIMEOUT_SECONDS = 600
 
 
 def discover_cases(cases_dir: Path) -> list[Path]:
-    """Return graph inputs, excluding evaluator traces and result JSON files."""
+    """返回 case 输入文件，排除评测器中转产出的 trace/result JSON。
+
+    评测器会在同目录下留下 ``case_001_problem_1_trace.json`` 这类文件，朴素
+    glob ``case_*.json`` 会把它们误当成输入图。这里用更严格的正则匹配。
+    """
     cases_dir = cases_dir.resolve()
     cases = sorted(
         path
@@ -68,7 +81,7 @@ def discover_cases(cases_dir: Path) -> list[Path]:
 
 
 def _run(command: list[str], timeout_seconds: int) -> str:
-    """Run one official script and return its concise standard output."""
+    """运行一条官方脚本并返回其标准输出的精简版。"""
     try:
         completed = subprocess.run(
             command,
@@ -86,7 +99,7 @@ def _run(command: list[str], timeout_seconds: int) -> str:
 
 
 def _metrics(result: dict[str, Any]) -> dict[str, Any]:
-    """Keep the primary metrics visible in aggregates without dropping detail."""
+    """把评测器 result 中的关键指标挑出来放进 aggregate，不丢细节。"""
     metrics = {
         "makespan": result.get("makespan"),
         "num_cores": result.get("num_cores"),
@@ -99,7 +112,11 @@ def _metrics(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _case_seed(graph_path: Path, base_seed: int) -> int:
-    """Make plans deterministic while avoiding the same random stream per case."""
+    """每个 case 用 ``base_seed + case_<n> 的 n`` 作为种子，保证：
+
+        1. 不同 case 的 stub 不会巧合使用同一随机流；
+        2. 同一 case 多次跑结果完全确定，便于回归。
+    """
     match = re.fullmatch(r"case_([0-9]+)", graph_path.stem)
     return base_seed + (int(match.group(1)) if match else 0)
 
@@ -113,7 +130,7 @@ def generate_plan(
     max_subgraph_size: int,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    """Generate and persist one stub plan; no evaluator is called here."""
+    """生成并保存一份 stub 方案；这里不调用任何评测器。"""
     graph_path = graph_path.resolve()
     config_path = graph_path.parent / "config.txt"
     if not config_path.is_file():
@@ -152,7 +169,7 @@ def evaluate_plan(
     question: str,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    """Run one official evaluator for an already generated stub plan."""
+    """对已生成的 stub 方案跑一次官方评测器。"""
     code_dir = Path(__file__).resolve().parents[1] / "artifacts" / "code"
     problem = int(question[1:])
     evaluator = code_dir / f"multicore_cut_evaluate_problem_{problem}.py"
@@ -181,6 +198,7 @@ def evaluate_plan(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口：分两阶段跑 stub → 评测器，最后落盘 batch.json。"""
     parser = argparse.ArgumentParser(description="批量运行 artifacts/code 的多核 stub 评测")
     parser.add_argument("--cases-dir", type=Path,
                         default=Path(__file__).resolve().parents[1] / "artifacts" / "data")
@@ -211,9 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cores = tuple(sorted(set(args.cores)))
     questions = tuple(args.q)
-    # Phase 1: generate every stub plan first.  This separate pool fully drains
-    # before any evaluator job is submitted, so all input plans are available
-    # for inspection even when a later evaluator fails.
+    # Phase 1: 先用线程池跑完所有 stub plan。把它单独排空再开评测，是为了
+    # 即使后续评测失败，所有输入方案也已落盘可供排查。
     states: list[dict[str, Any]] = [
         {
             "case": graph_path.stem,
@@ -253,8 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             progress.close()
 
-    # Phase 2: evaluate only plans successfully written in phase 1.  There are
-    # normally 100 * 5 * 3 = 1500 independent official evaluator processes.
+    # Phase 2: 仅评测 Phase 1 成功生成的方案。通常有 100 × 5 × 3 = 1500 个
+    # 独立的官方评测进程，所以用线程池并发。
     evaluator_jobs = [
         (index, graph_path, num_cores, question)
         for index, graph_path in enumerate(graph_paths)
@@ -286,11 +303,12 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             progress.close()
 
+    # 汇总每 case 一个 aggregate.json，并按 evaluate_multicore 的口径计算 speedup。
     cases: list[dict[str, Any]] = []
     for state in states:
         runs = [state["runs"][num_cores] for num_cores in cores if num_cores in state["runs"]]
-        # Match evaluate_multicore.py's aggregate semantics: one core is the
-        # baseline whenever its corresponding evaluator result is available.
+        # 与 evaluate_multicore.py 保持一致：只要有 1 核结果，就用它做 speedup
+        # 基线。
         baseline: dict[str, int | float | None] = {}
         for question in questions:
             metrics = state["runs"].get(1, {}).get("problems", {}).get(question, {}).get("metrics", {})

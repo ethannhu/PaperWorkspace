@@ -1,7 +1,24 @@
+# ============================================================
+# 人工智能工具信息 | AI Tool Information
+#   工具名称 (Tool Name)        : GLM-5.2
+#   版本/型号 (Version/Model)   : GLM-5.2
+#   开发机构/公司 (Developer)    : 智谱AI (Zhipu AI / zai-org)
+#   版本颁布日期 (Release Date) : 2026-06-13
+#   声明：本程序及代码是在人工智能工具辅助下完成的
+# ============================================================
 """Q2 独立分区与调度算法。
 
 Q2 负责普通多核执行场景；本文件包含自己的分区、调度和入口逻辑，
 不依赖 Q1 或 Q3 的算法模块。
+
+Q2 的成本模型（scene-B）：
+    * 跨核固定等待 = 500 cycles；
+    * 跨核字节传输带宽 = 60 bytes/cycle，传输时间 = ceil(bytes/60)；
+    * **同核不收固定等待**（这是 Q2 与 Q1 scene-A 的关键差别）。
+
+策略树与 Q1/Q3 类似，但每个分支会显式选择是否启用 ``communication_aware``
+与 ``adaptive_core_control``，并支持五组消融：
+no_structure / no_communication / no_critical_path / no_core_control。
 """
 
 from __future__ import annotations
@@ -19,14 +36,17 @@ from .algorithm_common import (
 )
 from .interfaces import AlgorithmResult
 
+# None 表示完整策略；其余字符串为消融开关。
+ABLATIONS = {None, "no_structure", "no_communication", "no_critical_path", "no_core_control"}
+
 
 def _semantic_plan(
     features: GraphFeatures,
     num_cores: int,
     scenario: str,
 ) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
+    """默认完整策略：语义分块 + 通信感知列表调度。"""
     # Q2 的默认路径：语义分区之后进行通信感知的列表调度。
-    """Current complete strategy: semantic blocks followed by list scheduling."""
     from .semantic_partition import semantic_partition
 
     partitions = semantic_partition(features)
@@ -42,14 +62,12 @@ def _coalesce_topological_partitions(
     max_ops: int,
     max_cycles: int,
 ) -> list[Partition]:
-    """Merge adjacent partition-DAG blocks without crossing topological order.
+    """按拓扑序合并相邻分区块，不跨越拓扑方向。
 
-    The semantic merger deliberately refuses many fan-in/fan-out joins.  That
-    is useful for ordinary graphs, but it leaves wide replicated graphs with
-    one block per operator.  Consecutive blocks in a topological order can be
-    coalesced safely: every edge between the resulting intervals still points
-    forward, so the quotient graph remains acyclic.  The size limits preserve
-    enough intra-core parallelism and keep live memory pressure bounded.
+    语义合并器刻意拒绝许多 fan-in/fan-out 汇合。对普通图这是合理的，但会让
+    宽复制图退化为“每个算子一块”。在拓扑序上把连续块直接拼接是安全的：合并
+    区间之间的所有边仍然正向，商图仍然无环。``max_ops`` / ``max_cycles`` 上
+    限既保留核内并行度，也限制活跃内存压力。
     """
     if not partitions:
         return []
@@ -112,7 +130,7 @@ def _schedule_pipelined_topology(
     partitions: list[Partition],
     num_cores: int,
 ) -> list[list[int]]:
-    """Spread a narrow dependency spine so successive blocks can overlap."""
+    """把窄依赖主链按轮转散开，让相邻块跨核重叠执行。"""
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
     orders = [[] for _ in range(num_cores)]
@@ -127,23 +145,20 @@ def _wide_plan(
     scenario: str,
     pattern: Any,
 ) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
-    """Communication-aware strategy for wide replicated computation graphs.
+    """针对“宽并行复制图”的通信感知策略。
 
-    WIDE graphs expose abundant parallelism, but fan-in/fan-out prevents the
-    strict semantic pass from fusing enough operators.  Coalesce its blocks in
-    topological intervals, keeping compute/activation or gate stages local
-    while preventing a single partition from becoming too large.
+    WIDE 图天然有充足并行度，但 fan-in/fan-out 阻挡了严格语义合并凑出足够大
+    的算子组。在拓扑区间上把块再合并，使 compute/activation 或门控 stage 保
+    持本地，同时防止单个分区过大失去并行度。
     """
     from .graph_patterns import GraphPattern
     from .semantic_partition import semantic_partition
 
     operator_count = len(features.topo_order)
     if pattern == GraphPattern.WIDE_MATMUL_ADD:
-        # MatMul-Add graphs are dominated by repeated compute/ADD tiles.  The
-        # old wide fallback left shallow cases at one semantic block per small
-        # tile, so Q2 paid a boundary transfer for work that Q1 kept local.
-        # Match Q1's bounded fusion policy, but retain the Q2 scheduler and
-        # its scene-B communication model below.
+        # MatMul-Add 几乎全是 compute/ADD tile。旧的宽回退把浅图留在“每小块
+        # 一块”的状态，Q2 因此为 Q1 已收编的工作额外付边界传输。下面沿用 Q1
+        # 的有界融合策略，但保留 Q2 调度器与 scene-B 通信模型。
         layer_width = max(
             (
                 sum(features.depth[node] == level for node in features.topo_order)
@@ -176,6 +191,7 @@ def _wide_plan(
         max_ops, max_cycles = 24, 16000
         motif = "compute_activation_branch"
     if pattern == GraphPattern.SHALLOW_WIDE_COMPUTE_ACTIVATION and operator_count < 5000:
+        # 浅宽且规模不大 → 退回纯语义分块（与 Q1 同分支）。
         base = semantic_partition(features, max_ops=16, max_cycles=20000)
         max_ops, max_cycles = 16, 20000
         motif = "semantic_wide_fallback"
@@ -207,13 +223,15 @@ def _complex_plan(
     num_cores: int,
     scenario: str,
     pattern: Any,
+    critical_affinity: bool = True,
+    adaptive_core_control: bool = True,
+    communication_aware: bool = True,
 ) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
-    """Strategy for residual/attention-like graphs with expensive joins.
+    """针对残差/Attention 这类“复杂图”的策略。
 
-    Complex graphs usually lose more from splitting a long residual or
-    normalize chain than they gain from exposing tiny extra tasks.  Use the
-    semantic partitioner with singleton repair, then keep the partition DAG's
-    heaviest critical spine sticky during scheduling.
+    复杂图通常从拆分长残差/归一化链路中损失更多，远比暴露几个小 task 得到
+    的收益多。语义分区器开启 singleton 修复，并把分区 DAG 上最重的关键主链
+    用粘性调度保持连贯。
     """
     from .semantic_partition import semantic_partition
 
@@ -227,11 +245,9 @@ def _complex_plan(
     critical_cycles = sum(partitions[pid].cycles for pid in critical_path)
     from .graph_patterns import GraphPattern
 
-    # A narrow/deep CNN can be a replicated family of independent residual
-    # branches.  Protecting one arbitrary branch with sticky affinity leaves
-    # one core nearly idle and overloads another.  Preserve branch parallelism
-    # for this shape; wider CNNs and truly serial residual spines keep the
-    # critical-path scheduler.
+    # 窄而深的 CNN 可能是若干独立的残差分支副本。给一条任意分支上关键路径
+    # 粘性会让一个核接近空闲、其他核过载。对这种形态要保留分支并行度；更宽
+    # 的 CNN 与真正串行的残差主链则继续走关键路径调度。
     layer_width = max(
         (
             sum(features.depth[node] == level for node in features.topo_order)
@@ -249,12 +265,11 @@ def _complex_plan(
         or pattern == GraphPattern.CNN_RESIDUAL and critical_cycles > 50000
     ):
         if replicated_narrow_cnn:
-            # Tiny replicated chains are transfer-bound: case_044 has eleven
-            # 7,672-cycle chains, and spreading them past two cores makes the
-            # extra COPY_IN traffic exceed the compute saved.  Larger replicas
-            # (for example case_046 and case_078) retain the full core count.
+            # 副本链小且传输受限：case_044 有 11 条 7672-cycle 链，超过 2 核
+            # 会让 COPY_IN 流量超过节省的计算。更长副本（case_046/078）则保
+            # 留完整核数。
             effective_cores = (
-                min(num_cores, 2) if critical_cycles <= 10000 else num_cores
+                min(num_cores, 2) if critical_cycles <= 10000 and adaptive_core_control else num_cores
             )
             core_orders = _schedule_replicated_components(
                 partitions, effective_cores
@@ -262,17 +277,22 @@ def _complex_plan(
             core_orders.extend([[] for _ in range(num_cores - effective_cores)])
             scheduler = "balanced_replicated_component_list"
         else:
-            core_orders = _schedule_partitions(partitions, features, num_cores, scenario)
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario, communication_aware)
             scheduler = "plain_list_after_complex_fusion"
     else:
-        core_orders = _schedule_complex_partitions(
+        if critical_affinity:
+            core_orders = _schedule_complex_partitions(
             partitions,
             features,
             num_cores,
             scenario,
             critical_path,
-        )
-        scheduler = "critical_path_sticky"
+            communication_aware=communication_aware,
+            )
+            scheduler = "critical_path_sticky"
+        else:
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario, communication_aware)
+            scheduler = "plain_list_without_critical_path"
     return partitions, core_orders, {
         "strategy": "complex_semantic_critical_path",
         "scheduler": scheduler,
@@ -283,9 +303,11 @@ def _complex_plan(
         "replicated_narrow_cnn": replicated_narrow_cnn,
         "effective_core_count": (
             min(num_cores, 2)
-            if replicated_narrow_cnn and critical_cycles <= 10000
+            if replicated_narrow_cnn and critical_cycles <= 10000 and adaptive_core_control
             else num_cores
         ),
+        "critical_path_affinity": critical_affinity,
+        "adaptive_core_control": adaptive_core_control,
     }
 
 
@@ -293,20 +315,19 @@ def _mixed_plan(
     features: GraphFeatures,
     num_cores: int,
     scenario: str,
+    critical_affinity: bool = True,
+    communication_aware: bool = True,
 ) -> tuple[list[Partition], list[list[int]], dict[str, Any]]:
-    """Plan the medium-sized mixed MLP/Reduce family.
+    """针对“中等规模混合 MLP/Reduce”图族的策略。
 
-    MIXED graphs have enough joins to make a purely local greedy fusion noisy,
-    but not enough serial depth to justify the aggressive sticky policy used
-    by attention and residual graphs.  Keep blocks smaller when the graph is
-    wide/deep, repair only profitable singleton blocks, then protect one heavy
-    partition path with a reduced affinity penalty.
+    MIXED 图的汇合数足够多以致纯贪心合并会很嘈杂，但又没有足够串行深度去
+    支持 attention/残差图的强力粘性策略。当图宽/图深更大时使用更小的块，
+    仅修复有收益的 singleton，然后用更低的粘性惩罚保护一条重分区路径。
     """
     from .semantic_partition import semantic_partition
 
-    # The documented MIXED median is 34 levels / 152 nodes per level.  These
-    # limits preserve branch parallelism while still fusing short compute,
-    # activation, and reduction stages.
+    # 文档标注的 MIXED 中位数是 34 层 / 每层 152 节点。下面的上限在保留分支
+    # 并行的同时仍能融合短 compute / activation / reduce stage。
     wide_or_deep = (
         max(features.depth.values(), default=0) >= 60
         or max(
@@ -325,17 +346,20 @@ def _mixed_plan(
     )
     critical_path = _critical_partition_path(partitions, features)
     critical_cycles = sum(partitions[pid].cycles for pid in critical_path)
-    core_orders = _schedule_complex_partitions(
-        partitions,
-        features,
-        num_cores,
-        scenario,
-        critical_path,
-        split_penalty_scale=0.35,
-    )
+    if critical_affinity:
+        # 0.35 比默认 1.0 更柔和；MIXED 不像 COMPLEX 那样需要硬粘性。
+        core_orders = _schedule_complex_partitions(
+            partitions, features, num_cores, scenario, critical_path,
+            split_penalty_scale=0.35, communication_aware=communication_aware,
+        )
+        scheduler = "critical_path_soft_sticky"
+    else:
+        core_orders = _schedule_partitions(partitions, features, num_cores, scenario, communication_aware)
+        scheduler = "plain_list_without_critical_path"
     return partitions, core_orders, {
         "strategy": "mixed_semantic_fusion_critical_path",
-        "scheduler": "critical_path_soft_sticky",
+        "scheduler": scheduler,
+        "critical_path_affinity": critical_affinity,
         "partition_count": len(partitions),
         "critical_path_length": len(critical_path),
         "critical_path_cycles": critical_cycles,
@@ -346,6 +370,7 @@ def _mixed_plan(
 
 
 def _partition_topology(partitions: list[Partition]) -> list[int]:
+    """对分区 DAG 跑一次拓扑排序。"""
     preds = {p.id: set(p.preds) for p in partitions}
     succs = {p.id: set(p.succs) for p in partitions}
     return _topological_order([p.id for p in partitions], preds, succs)
@@ -355,19 +380,18 @@ def _schedule_replicated_components(
     partitions: list[Partition],
     num_cores: int,
 ) -> list[list[int]]:
-    """Pack disconnected branch components without splitting a branch.
+    """把不连通的分支组件按“整条分支”打包，不拆分支。
 
-    Narrow/deep residual inputs often contain replicated independent chains.
-    Their partition DAG has no edges between replicas, so treating every
-    partition as an independent ready task can interleave branches and create
-    avoidable memory-pipeline dependencies.  Keep each component contiguous
-    and use largest-processing-time-first packing across cores.
+    窄/深残差输入常常包含若干独立链路副本。它们的分区 DAG 中副本之间没有
+    边，把每个分区当独立就绪 task 处理会让分支交错，制造可避免的内存管线依
+    赖。每个组件保持连续，按 LPT（最大处理时间优先）打包到各核。
     """
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
     if not partitions:
         return [[] for _ in range(num_cores)]
 
+    # 1) 找连通分量：neighbours = preds ∪ succs。
     by_id = {partition.id: partition for partition in partitions}
     neighbours = {
         partition.id: partition.preds | partition.succs
@@ -388,6 +412,7 @@ def _schedule_replicated_components(
                 stack.append(neighbour)
         components.append(component)
 
+    # 2) 组件内部按拓扑序；组件之间按 work 降序（LPT）打包。
     topo = _partition_topology(partitions)
     topo_index = {pid: index for index, pid in enumerate(topo)}
     ordered_components: list[tuple[int, list[int], int]] = []
@@ -397,6 +422,7 @@ def _schedule_replicated_components(
         ordered_components.append((work, ordered, min(ordered)))
     ordered_components.sort(key=lambda item: (-item[0], item[2]))
 
+    # 3) LPT：把组件扔给当前负载最轻的核。
     assigned_components: list[list[list[int]]] = [
         [] for _ in range(num_cores)
     ]
@@ -406,9 +432,9 @@ def _schedule_replicated_components(
         assigned_components[core].append(component)
         core_load[core] += work
 
-    # Keep replicas interleaved by stage.  Concatenating whole components
-    # serializes one branch before touching the next and defeats Q2/Q3
-    # same-core tensor reuse, especially when all components share a core.
+    # 4) 同核多副本按 stage 交错拼接，而不是连整条 branch。
+    # 直接连整条会让一条 branch 整段跑完才轮到下一条，破坏 Q2/Q3 同核张量复用，
+    # 特别是当多个副本落在同核时。
     core_orders: list[list[int]] = []
     for components in assigned_components:
         order: list[int] = []
@@ -424,7 +450,7 @@ def _critical_partition_path(
     partitions: list[Partition],
     features: GraphFeatures,
 ) -> list[int]:
-    """Return one heavy downstream path through the partition DAG."""
+    """找出分区 DAG 上的一条重下游路径。"""
     if not partitions:
         return []
     by_id = {partition.id: partition for partition in partitions}
@@ -436,6 +462,7 @@ def _critical_partition_path(
         best_successor = None
         best_score = 0
         for successor in partition.succs:
+            # 把跨核边传输时间（按 60 bytes/cycle 折算）也算进路径分数。
             edge_cycles = math.ceil(
                 _partition_edge_size(partitions, features, pid, successor) / 60
             )
@@ -458,9 +485,19 @@ def _schedule_partitions(
     features: GraphFeatures,
     num_cores: int,
     scenario: str = "q2",
+    communication_aware: bool = True,
 ) -> list[list[int]]:
+    """关键路径优先的列表调度器（同构核，scene-B 通信模型）。
+
+    与 Q1 ``_schedule_partitions`` 区别：
+        * ``communication_aware=False`` 时关闭跨核通信感知，调度只看负载（用于
+          ``no_communication`` 消融）；
+        * Q2 scene-B 只在跨核时收 500 + bytes/60，同核为 0（Q1 scene-A 不论同
+          核/跨核都收固定等待）；
+        * 目标元组与 Q1 一致：``(objective_end, pipe_imbalance, max_pipe_load,
+          end, core)``。
+    """
     # 用依赖就绪时间、计算结束时间和管线负载共同选择目标核。
-    """Critical-path-first list schedule for identical cores."""
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
     if scenario not in {"q1", "q2", "q3"}:
@@ -476,8 +513,7 @@ def _schedule_partitions(
     core_of: dict[int, int] = {}
     core_orders: list[list[int]] = [[] for _ in range(num_cores)]
     bandwidth = 60
-    # Scene-A uses a cheaper same-core wait than a cross-core wait.  These are
-    # the fixed evaluator values from config.txt.
+    # scene-A 的同核等待便宜、跨核等待贵。这两个数固定取自 config.txt。
     same_core_wait = 100
     cross_core_wait = 1000
     core_pipe_load: list[dict[str, int]] = [dict() for _ in range(num_cores)]
@@ -510,16 +546,16 @@ def _schedule_partitions(
                     delay = (
                         same_core_wait if core_of.get(pred) == core else cross_core_wait
                     ) + math.ceil(edge_bytes / bandwidth)
-                elif core_of.get(pred) != core:
+                elif communication_aware and core_of.get(pred) != core:
+                    # scene-B：仅跨核才收 500 + bytes/60。
                     edge_bytes = _partition_edge_size(partitions, features, pred, pid)
                     candidate_edge_bytes += edge_bytes
                     delay = 500 + math.ceil(edge_bytes / bandwidth)
                 dependency_ready = max(dependency_ready, finish[pred] + delay)
             start = max(core_time[core], dependency_ready)
             end = start + partition.cycles
-            # Pipe work is a lower-bound signal for the evaluator's overlapped
-            # intra-core execution.  Keep the conservative total-cycle end
-            # estimate, but prefer placements with lower per-pipe pressure.
+            # Pipe 工作量是评测器核内重叠执行的下界信号。保留保守“总 end”估
+            # 计，同时优先选管线压力更小的核。
             pipe_load = dict(core_pipe_load[core])
             for pipe, work in partition.pipe_cycles.items():
                 pipe_load[pipe] = pipe_load.get(pipe, 0) + work
@@ -527,8 +563,8 @@ def _schedule_partitions(
             total_pipe_work = sum(pipe_load.values())
             avg_pipe_load = total_pipe_work / max(1, len(pipe_load))
             pipe_imbalance = max_pipe_load / max(1.0, avg_pipe_load)
-            ddr_lb = (estimated_ddr_bytes + candidate_edge_bytes) / bandwidth
-            # The lower bound cannot be hidden below the compute estimate.
+            ddr_lb = (estimated_ddr_bytes + candidate_edge_bytes) / bandwidth if communication_aware else 0
+            # DDR 下界无法藏在计算时间下面，所以目标 end 取 max(end, ddr_lb)。
             objective_end = max(float(end), ddr_lb)
             choice = (objective_end, pipe_imbalance, max_pipe_load, end, core)
             if best is None or choice < best:
@@ -537,7 +573,7 @@ def _schedule_partitions(
         _, _, _, end, core = best
         candidate_edge_bytes = 0
         for pred in partition.preds:
-            if scenario == "q1" or core_of.get(pred) != core:
+            if scenario == "q1" or (communication_aware and core_of.get(pred) != core):
                 candidate_edge_bytes += _partition_edge_size(
                     partitions, features, pred, pid
                 )
@@ -548,6 +584,7 @@ def _schedule_partitions(
         for pipe, work in partition.pipe_cycles.items():
             core_pipe_load[core][pipe] = core_pipe_load[core].get(pipe, 0) + work
         core_orders[core].append(pid)
+        # 后继前驱计数 -1，归零则加入 ready。
         for successor in partition.succs:
             remaining[successor] -= 1
             if remaining[successor] == 0:
@@ -562,8 +599,14 @@ def _schedule_complex_partitions(
     scenario: str,
     critical_path: list[int],
     split_penalty_scale: float = 1.0,
+    communication_aware: bool = True,
 ) -> list[list[int]]:
-    """Schedule complex graphs while keeping the critical spine coherent."""
+    """带关键路径粘性的复杂图调度器。
+
+    与 ``_schedule_partitions`` 差异：ready 排序里把 critical_set 放最前面、按
+    路径序优先；每个候选分区选“粘性核”，放在非粘性核则给目标 end 加
+    ``_complex_split_penalty`` 惩罚。
+    """
     if num_cores < 1:
         raise ValueError("num_cores must be positive")
     if scenario not in {"q1", "q2", "q3"}:
@@ -574,6 +617,7 @@ def _schedule_complex_partitions(
     topo_position = {pid: index for index, pid in enumerate(topo)}
     critical_index = {pid: index for index, pid in enumerate(critical_path)}
     critical_set = set(critical_path)
+    # critical_predecessor: 关键路径上每个分区的“前一个”分区。
     critical_predecessor = {
         critical_path[index]: critical_path[index - 1]
         for index in range(1, len(critical_path))
@@ -605,6 +649,7 @@ def _schedule_complex_partitions(
         )
         pid = ready.pop(0)
         partition = by_id[pid]
+        # 选粘性核：保护关键路径前驱所在核。
         sticky_core = _preferred_complex_core(
             partitions,
             features,
@@ -624,7 +669,7 @@ def _schedule_complex_partitions(
                     delay = (
                         100 if core_of.get(pred) == core else 1000
                     ) + math.ceil(edge_bytes / bandwidth)
-                elif core_of.get(pred) != core:
+                elif communication_aware and core_of.get(pred) != core:
                     edge_bytes = _partition_edge_size(partitions, features, pred, pid)
                     candidate_edge_bytes += edge_bytes
                     delay = 500 + math.ceil(edge_bytes / bandwidth)
@@ -638,9 +683,10 @@ def _schedule_complex_partitions(
             total_pipe_work = sum(pipe_load.values())
             avg_pipe_load = total_pipe_work / max(1, len(pipe_load))
             pipe_imbalance = max_pipe_load / max(1.0, avg_pipe_load)
-            ddr_lb = (estimated_ddr_bytes + candidate_edge_bytes) / bandwidth
+            ddr_lb = (estimated_ddr_bytes + candidate_edge_bytes) / bandwidth if communication_aware else 0
             objective_end = max(float(end), ddr_lb)
-            if sticky_core is not None and core != sticky_core:
+            # 放在非粘性核 → 加 split_penalty（仅 communication_aware 时）。
+            if communication_aware and sticky_core is not None and core != sticky_core:
                 objective_end += _complex_split_penalty(
                     partitions,
                     features,
@@ -656,7 +702,7 @@ def _schedule_complex_partitions(
         _, _, _, end, core = best
         candidate_edge_bytes = 0
         for pred in partition.preds:
-            if scenario == "q1" or core_of.get(pred) != core:
+            if scenario == "q1" or (communication_aware and core_of.get(pred) != core):
                 candidate_edge_bytes += _partition_edge_size(
                     partitions, features, pred, pid
                 )
@@ -681,7 +727,11 @@ def _preferred_complex_core(
     core_of: dict[int, int],
     critical_predecessor: dict[int, int],
 ) -> int | None:
-    """Pick the predecessor core worth preserving for a complex-graph join."""
+    """为复杂图汇合处挑出一个值得保留的前驱核。
+
+    优先保留关键路径前驱所在核；否则取共享字节数最大的前驱所在核；如果该
+    分区只有 1 个前驱且无共享字节，则不强制粘性（返回 None）。
+    """
     critical_pred = critical_predecessor.get(pid)
     if critical_pred is not None and critical_pred in core_of:
         return core_of[critical_pred]
@@ -710,7 +760,11 @@ def _complex_split_penalty(
     scenario: str,
     scale: float = 1.0,
 ) -> float:
-    """Extra cost for splitting protected complex-chain dependencies."""
+    """复杂链路被拆开时的额外惩罚。
+
+    取所有“已落核前驱”与当前分区之间最大的边字节数，按 60 bytes/cycle 折算
+    传输时间，加上 scenario 固定等待（Q1=1000，Q2/Q3=500），再乘 scale。
+    """
     edge_bytes = max(
         (
             _partition_edge_size(partitions, features, pred, pid)
@@ -725,6 +779,7 @@ def _complex_split_penalty(
 
 
 def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, source: int, target: int) -> int:
+    """两个分区之间所有 source_op→target_op 边的最大字节数。"""
     source_ops = partitions[source].ops
     target_ops = partitions[target].ops
     return max(
@@ -736,7 +791,11 @@ def _partition_edge_size(partitions: list[Partition], features: GraphFeatures, s
 def _partition_cache_reuse(
     partitions: list[Partition], features: GraphFeatures
 ) -> dict[int, int]:
-    """Estimate Q3 reuse value from tensors consumed by multiple partitions."""
+    """估计 Q3 缓存复用价值：被多个分区消费的张量 × 张量大小 × (复用次数)。
+
+    一个张量被 N 个分区消费时，第二次之后的访问可以命中 L2，因此乘以
+    (N-1)。结果仅作“优先级信号”，不是精确预算。
+    """
     users: dict[int, set[int]] = {}
     inputs: dict[int, set[int]] = {}
     for partition in partitions:
@@ -760,7 +819,7 @@ def _partition_cache_reuse(
 
 
 def _q3_reuse_priority(features: GraphFeatures) -> bool:
-    """Enable reuse ordering only for branch-heavy replicated motifs."""
+    """仅对分支重图族开启缓存优先级排序（CNN/GATED）。"""
     from .graph_patterns import GraphPattern, classify_features
 
     return classify_features(features).pattern in {
@@ -773,41 +832,81 @@ def build_algorithm_plan(
     features: GraphFeatures,
     num_cores: int = 4,
     scenario: str = "q2",
+    ablation: str | None = None,
 ) -> AlgorithmResult:
+    """根据图族模式选择完整策略构建 Q2 方案。
+
+    流程：
+        1. 由 ``ablation`` 设定 ``communication_aware``、``critical_affinity``、
+           ``adaptive_core_control`` 三个开关；
+        2. classify_features 路由到 WIDE/COMPLEX/MIXED/默认策略；
+        3. ``no_structure`` 则跳过路由，走默认语义分区；
+        4. 若 effective_core_count < num_cores（短副本限制），跳过全局再平衡；
+        5. 写入关键路径、负载 CV 等诊断字段。
+
+    Q2 在本文件内完成图族识别、分区和调度，不调用其他题目的入口。
+    """
     # Q2 在本文件内完成图族识别、分区和调度，不调用其他题目的入口。
-    """Build a plan with the complete strategy chosen by graph pattern."""
     from .graph_patterns import GraphPatternFamily, classify_features
 
+    if ablation not in ABLATIONS:
+        raise ValueError(f"unknown q2 ablation: {ablation!r}")
     graph_pattern = classify_features(features)
-    if graph_pattern.family == GraphPatternFamily.WIDE:
+    communication_aware = ablation != "no_communication"
+    critical_affinity = ablation != "no_critical_path"
+    adaptive_core_control = ablation != "no_core_control"
+    if ablation == "no_structure":
+        # no_structure 消融：禁用图族路由与 motif 分支，直接走默认语义分区。
+        from .semantic_partition import semantic_partition
+
+        partitions = semantic_partition(features)
+        critical_path = _critical_partition_path(partitions, features)
+        if graph_pattern.family.name == "COMPLEX" and critical_path and critical_affinity:
+            core_orders = _schedule_complex_partitions(
+                partitions, features, num_cores, scenario, critical_path,
+                communication_aware=communication_aware,
+            )
+            scheduler = "critical_path_sticky"
+        else:
+            core_orders = _schedule_partitions(
+                partitions, features, num_cores, scenario, communication_aware
+            )
+            scheduler = "plain_list"
+        strategy_diagnostics = {
+            "strategy": "default_semantic_partition",
+            "scheduler": scheduler,
+            "partition_count": len(partitions),
+            "critical_path_length": len(critical_path),
+            "critical_path_cycles": sum(partitions[pid].cycles for pid in critical_path),
+            "effective_core_count": num_cores,
+        }
+    elif graph_pattern.family == GraphPatternFamily.WIDE:
         partitions, core_orders, strategy_diagnostics = _wide_plan(
-            features,
-            num_cores,
-            scenario,
-            graph_pattern.pattern,
+            features, num_cores, scenario, graph_pattern.pattern
         )
+        if not communication_aware:
+            # 关闭通信感知 → 重新调度一次（只看负载）。
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario, False)
+            strategy_diagnostics["scheduler"] = "load_only_list"
     elif graph_pattern.family == GraphPatternFamily.COMPLEX:
         partitions, core_orders, strategy_diagnostics = _complex_plan(
-            features,
-            num_cores,
-            scenario,
-            graph_pattern.pattern,
+            features, num_cores, scenario, graph_pattern.pattern,
+            critical_affinity, adaptive_core_control, communication_aware,
         )
     elif graph_pattern.family == GraphPatternFamily.MIXED:
         partitions, core_orders, strategy_diagnostics = _mixed_plan(
-            features,
-            num_cores,
-            scenario,
+            features, num_cores, scenario, critical_affinity, communication_aware
         )
     else:
         partitions, core_orders, strategy_diagnostics = _semantic_plan(
-            features,
-            num_cores,
-            scenario,
+            features, num_cores, scenario
         )
-    if strategy_diagnostics.get("effective_core_count", num_cores) < num_cores:
-        # The short-replica guard deliberately leaves trailing cores idle;
-        # global migration must not repopulate them with tiny partitions.
+        if not communication_aware:
+            core_orders = _schedule_partitions(partitions, features, num_cores, scenario, False)
+            strategy_diagnostics["scheduler"] = "load_only_list"
+    if adaptive_core_control and strategy_diagnostics.get("effective_core_count", num_cores) < num_cores:
+        # 短副本限制会刻意留出尾部核空闲；全局迁移绝不能用小分区重新塞满它们，
+        # 否则会破坏副本分组与 stage 交错。
         rebalance_diagnostics = {
             "enabled": False,
             "reason": "short_replicated_chain_core_cap",
@@ -818,12 +917,32 @@ def build_algorithm_plan(
             partitions, features, core_orders, scenario
         )
     strategy_diagnostics["global_rebalance"] = rebalance_diagnostics
+    strategy_diagnostics["variant"] = ablation or "full"
+    strategy_diagnostics["partition_count"] = len(partitions)
     node_to_subgraph = {
         str(op_id): partition.id
         for partition in partitions
         for op_id in partition.ops
     }
-    # Empty cores are intentionally retained in the output.
+    owners = {pid: core for core, order in enumerate(core_orders) for pid in order}
+    critical_path = _critical_partition_path(partitions, features)
+    loads = [sum(partitions[pid].cycles for pid in order) for order in core_orders]
+    mean_load = sum(loads) / max(1, len(loads))
+    strategy_diagnostics.update({
+        "critical_path_partition_ids": critical_path,
+        "critical_path_length": len(critical_path),
+        "critical_path_cycles": sum(partitions[pid].cycles for pid in critical_path),
+        "critical_path_cross_core_edges": sum(
+            owners.get(left) != owners.get(right) for left, right in zip(critical_path, critical_path[1:])
+        ),
+        "core_loads": loads,
+        "load_cv": math.sqrt(sum((load - mean_load) ** 2 for load in loads) / len(loads)) / mean_load if mean_load else 0.0,
+        "max_load_ratio": max(loads, default=0) / mean_load if mean_load else 0.0,
+        "communication_aware": communication_aware,
+        "critical_path_affinity": critical_affinity,
+        "adaptive_core_control": adaptive_core_control,
+    })
+    # 空核刻意保留在输出中，便于评测器对照 effective_core_count。
     return AlgorithmResult(
         plan={
             "node_to_subgraph": node_to_subgraph,
@@ -840,9 +959,10 @@ def build_plan(
     graph: dict[str, Any],
     num_cores: int = 4,
     features: GraphFeatures | None = None,
+    ablation: str | None = None,
 ) -> AlgorithmResult:
+    """对外统一入口：输入原始图，输出子图编号和每个核的执行顺序。"""
     # 对外统一入口：输入原始图，输出子图编号和每个核的执行顺序。
-    """Build the Q2 plan using the current strategy implementation."""
     if features is None:
         features = analyze_graph(graph)
-    return build_algorithm_plan(features, num_cores, scenario="q2")
+    return build_algorithm_plan(features, num_cores, scenario="q2", ablation=ablation)
